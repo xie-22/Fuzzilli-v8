@@ -1,0 +1,1927 @@
+// Copyright 2020 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+package fuzzilli.protobuf;
+
+message Empty {}
+
+// Parameters used by function definitions, not an operation by itself.
+message Parameters {
+    uint32 count = 1;
+    bool hasRest = 2;
+    repeated uint32 defaultParameterIndices = 3;
+    map<uint32, FuzzILDestructuringPattern> destructuringParameters = 4;
+}
+
+message LoadInteger {
+    int64 value = 1;
+    optional string customName = 2;
+}
+
+message LoadBigInt {
+    int64 value = 1;
+}
+
+message LoadFloat {
+    double value = 1;
+}
+
+message LoadString {
+    string value = 1;
+    optional string customName = 2;
+}
+
+message LoadBoolean {
+    bool value = 1;
+}
+
+message LoadUndefined {
+}
+
+message LoadNull {
+}
+
+message LoadThis {
+}
+
+message LoadArguments {
+}
+
+message LoadDisposableVariable {
+}
+
+message LoadAsyncDisposableVariable {
+}
+
+message LoadRegExp {
+    string pattern = 1;
+    uint32 flags = 2;
+}
+
+message BeginObjectLiteral {
+}
+
+message ObjectLiteralAddProperty {
+    string propertyName = 1;
+}
+
+message ObjectLiteralAddElement {
+    int64 index = 1;
+}
+
+message ObjectLiteralAddComputedProperty {
+}
+
+message ObjectLiteralCopyProperties {
+}
+
+message ObjectLiteralSetPrototype {
+}
+
+message BeginObjectLiteralMethod {
+    string methodName = 1;
+    Parameters parameters = 2;
+    bool is_generator = 3;
+    bool is_async = 4;
+}
+
+message EndObjectLiteralMethod {
+}
+
+message BeginObjectLiteralComputedMethod {
+    Parameters parameters = 1;
+    bool is_generator = 2;
+    bool is_async = 3;
+}
+
+message EndObjectLiteralComputedMethod {
+}
+
+message BeginObjectLiteralGetter {
+    string propertyName = 1;
+}
+
+message EndObjectLiteralGetter {
+}
+
+message BeginObjectLiteralComputedGetter {
+}
+
+message EndObjectLiteralComputedGetter {
+}
+
+message BeginObjectLiteralSetter {
+    string propertyName = 1;
+}
+
+message EndObjectLiteralSetter {
+}
+
+message BeginObjectLiteralComputedSetter {
+}
+
+message EndObjectLiteralComputedSetter {
+}
+
+message EndObjectLiteral {
+}
+
+message BeginClassDefinition {
+    bool hasSuperclass = 1;
+    bool isExpression = 2;
+}
+
+message BeginClassConstructor {
+    Parameters parameters = 1;
+}
+
+message EndClassConstructor {
+}
+
+message ClassAddProperty {
+    string propertyName = 1;
+    bool hasValue = 2;
+    bool is_static = 3;
+}
+
+message ClassAddElement {
+    int64 index = 1;
+    bool hasValue = 2;
+    bool is_static = 3;
+}
+
+message ClassAddComputedProperty {
+    bool hasValue = 1;
+    bool is_static = 2;
+}
+
+message BeginClassMethod {
+    string methodName = 1;
+    Parameters parameters = 2;
+    bool is_static = 3;
+    bool is_generator = 4;
+    bool is_async = 5;
+}
+
+message EndClassMethod {
+}
+
+message BeginClassComputedMethod {
+    Parameters parameters = 1;
+    bool is_static = 2;
+    bool is_generator = 3;
+    bool is_async = 4;
+}
+
+message EndClassComputedMethod {
+}
+
+message BeginClassGetter {
+    string propertyName = 1;
+    bool is_static = 2;
+}
+
+message EndClassGetter {
+}
+
+message BeginClassComputedGetter {
+    bool is_static = 1;
+}
+
+message EndClassComputedGetter {
+}
+
+message BeginClassSetter {
+    string propertyName = 1;
+    bool is_static = 2;
+}
+
+message EndClassSetter {
+}
+
+message BeginClassComputedSetter {
+    bool is_static = 1;
+}
+
+message EndClassComputedSetter {
+}
+
+message BeginClassStaticInitializer {
+}
+
+message EndClassStaticInitializer {
+}
+
+message ClassAddPrivateProperty {
+    string propertyName = 1;
+    bool hasValue = 2;
+    bool is_static = 3;
+}
+
+message BeginClassPrivateMethod {
+    string methodName = 1;
+    Parameters parameters = 2;
+    bool is_static = 3;
+    bool is_generator = 4;
+    bool is_async = 5;
+}
+
+message EndClassPrivateMethod {
+}
+
+message BeginClassPrivateGetter {
+    string propertyName = 1;
+    bool is_static = 2;
+}
+
+message EndClassPrivateGetter {
+}
+
+message BeginClassPrivateSetter {
+    string propertyName = 1;
+    bool is_static = 2;
+}
+
+message EndClassPrivateSetter {
+}
+
+message EndClassDefinition {
+}
+
+message CreateArray {
+    optional string elementGroupName = 1;
+}
+
+message CreateIntArray {
+    repeated int64 values = 1;
+}
+
+message CreateFloatArray {
+    repeated double values = 1;
+}
+
+message CreateTemplateString {
+    repeated string parts = 1;
+}
+
+message CreateArrayWithSpread {
+    repeated bool spreads = 1;
+}
+
+message GetProperty {
+    string propertyName = 1;
+    bool isGuarded = 2;
+}
+
+message SetProperty {
+    string propertyName = 1;
+    bool isGuarded = 2;
+}
+
+message UpdateProperty {
+    string propertyName = 1;
+    BinaryOperator op = 2;
+}
+
+message DeleteProperty {
+    string propertyName = 1;
+    bool isGuarded = 2;
+}
+
+enum PropertyType {
+    VALUE = 0;
+    GETTER = 1;
+    SETTER = 2;
+    GETTERSETTER = 3;
+}
+
+message ConfigureProperty {
+    string propertyName = 1;
+    bool isWritable = 2;
+    bool isConfigurable = 3;
+    bool isEnumerable = 4;
+    PropertyType type = 5;
+}
+
+message GetElement {
+    int64 index = 1;
+    bool isGuarded = 2;
+}
+
+message SetElement {
+    int64 index = 1;
+}
+
+message UpdateElement {
+    int64 index = 1;
+    BinaryOperator op = 2;
+}
+
+message DeleteElement {
+    int64 index = 1;
+    bool isGuarded = 2;
+}
+
+message ConfigureElement {
+    int64 index = 1;
+    bool isWritable = 2;
+    bool isConfigurable = 3;
+    bool isEnumerable = 4;
+    PropertyType type = 5;
+}
+
+message GetComputedProperty {
+    bool isGuarded = 1;
+}
+
+message SetComputedProperty {
+}
+
+message UpdateComputedProperty {
+    BinaryOperator op = 1;
+}
+
+message DeleteComputedProperty {
+    bool isGuarded = 1;
+}
+
+message ConfigureComputedProperty {
+    bool isWritable = 1;
+    bool isConfigurable = 2;
+    bool isEnumerable = 3;
+    PropertyType type = 4;
+}
+
+message TypeOf {
+}
+
+message Void {
+}
+
+message TestInstanceOf {
+}
+
+message TestIn {
+}
+
+message BeginPlainFunction {
+    Parameters parameters = 1;
+    // Can be missing, in which case the name is auto-assigned.
+    string name = 2;
+}
+
+message EndPlainFunction {
+}
+
+message BeginWorkerFunction {
+    Parameters parameters = 1;
+    // Can be missing, in which case the name is auto-assigned.
+    string name = 2;
+}
+
+message EndWorkerFunction {
+}
+
+message BeginArrowFunction {
+    Parameters parameters = 1;
+}
+
+message EndArrowFunction {
+}
+
+message BeginGeneratorFunction {
+    Parameters parameters = 1;
+    // Can be missing, in which case the name is auto-assigned.
+    string name = 2;
+}
+
+message EndGeneratorFunction {
+}
+
+message BeginAsyncFunction {
+    Parameters parameters = 1;
+    // Can be missing, in which case the name is auto-assigned.
+    string name = 2;
+}
+
+message EndAsyncFunction {
+}
+
+message BeginAsyncArrowFunction {
+    Parameters parameters = 1;
+}
+
+message EndAsyncArrowFunction {
+}
+
+message BeginAsyncGeneratorFunction {
+    Parameters parameters = 1;
+    // Can be missing, in which case the name is auto-assigned.
+    string name = 2;
+}
+
+message EndAsyncGeneratorFunction {
+}
+
+message BeginConstructor {
+    Parameters parameters = 1;
+}
+
+message EndConstructor {
+}
+
+message Directive {
+    string content = 1;
+}
+
+message Return {
+}
+
+message Yield {
+}
+
+message YieldEach {
+}
+
+message Await {
+}
+
+message CallFunction {
+    bool isGuarded = 1;
+}
+
+message CallFunctionWithSpread {
+    repeated bool spreads = 1;
+    bool isGuarded = 2;
+}
+
+message Construct {
+    bool isGuarded = 1;
+}
+
+message ConstructWithSpread {
+    repeated bool spreads = 1;
+    bool isGuarded = 2;
+}
+
+message CallMethod {
+    string methodName = 1;
+    bool isGuarded = 2;
+}
+
+message CallMethodWithSpread {
+    string methodName = 1;
+    repeated bool spreads = 2;
+    bool isGuarded = 3;
+}
+
+message CallComputedMethod {
+    bool isGuarded = 1;
+}
+
+message CallComputedMethodWithSpread {
+    repeated bool spreads = 1;
+    bool isGuarded = 2;
+}
+
+enum UnaryOperator {
+    PRE_INC = 0;
+    PRE_DEC = 1;
+    POST_INC = 2;
+    POST_DEC = 3;
+    LOGICAL_NOT = 4;
+    BITWISE_NOT = 5;
+    PLUS = 6;
+    MINUS = 7;
+}
+
+message UnaryOperation {
+    UnaryOperator op = 1;
+}
+
+enum BinaryOperator {
+    ADD = 0;
+    SUB = 1;
+    MUL = 2;
+    DIV = 3;
+    MOD = 4;
+    BIT_AND = 5;
+    BIT_OR = 6;
+    LOGICAL_AND = 7;
+    LOGICAL_OR = 8;
+    XOR = 9;
+    LSHIFT = 10;
+    RSHIFT = 11;
+    EXP = 12;
+    UNRSHIFT = 13;
+}
+
+enum WasmIntegerBinaryOperator {
+    WASMI_ADD = 0;
+    WASMI_SUB = 1;
+    WASMI_MUL = 2;
+    WASMI_DIV_S = 3;
+    WASMI_DIV_U = 4;
+    WASMI_REM_S = 5;
+    WASMI_REM_U = 6;
+    WASMI_AND = 7;
+    WASMI_OR = 8;
+    WASMI_XOR = 9;
+    WASMI_SHL = 10;
+    WASMI_SHR_S = 11;
+    WASMI_SHR_U = 12;
+    WASMI_ROTL = 13;
+    WASMI_ROTR = 14;
+}
+
+enum WasmIntegerUnaryOperator {
+    WASM_CLZ = 0;
+    WASM_CTZ = 1;
+    WASM_POPCNT = 2;
+}
+
+enum WasmFloatBinaryOperator {
+    WASMF_ADD = 0;
+    WASMF_SUB = 1;
+    WASMF_MUL = 2;
+    WASMF_DIV = 3;
+    WASMF_MIN = 4;
+    WASMF_MAX = 5;
+    WASMF_COPYSIGN = 6;
+}
+
+enum WasmFloatUnaryOperator {
+    ABS = 0;
+    NEG = 1;
+    CEIL = 2;
+    FLOOR = 3;
+    TRUNC = 4;
+    NEAREST = 5;
+    SQRT = 6;
+}
+
+message BinaryOperation {
+    BinaryOperator op = 1;
+}
+
+message TernaryOperation {
+}
+
+message Update {
+    BinaryOperator op = 1;
+}
+
+message Dup {
+}
+
+message Reassign {
+}
+
+
+
+
+
+enum Comparator {
+    EQUAL = 0;
+    STRICT_EQUAL = 1;
+    NOT_EQUAL = 2;
+    STRICT_NOT_EQUAL = 3;
+    LESS_THAN = 4;
+    LESS_THAN_OR_EQUAL = 5;
+    GREATER_THAN = 6;
+    GREATER_THAN_OR_EQUAL = 7;
+}
+
+message Compare {
+    Comparator op = 1;
+}
+
+enum NamedVariableDeclarationMode {
+    NONE = 0;
+    GLOBAL = 1;
+    VAR = 2;
+    LET = 3;
+}
+
+message CreateNamedVariable {
+    string variableName = 1;
+    NamedVariableDeclarationMode declarationMode = 2;
+}
+
+message CreateNamedDisposableVariable {
+    string variableName = 1;
+}
+
+message CreateNamedAsyncDisposableVariable {
+    string variableName = 1;
+}
+
+message Eval {
+    string code = 1;
+    bool hasOutput = 2;
+}
+
+message CallSuperConstructor {
+    repeated bool spreads = 1;
+}
+
+message CallSuperMethod {
+    string methodName = 1;
+}
+
+message GetPrivateProperty {
+    string propertyName = 1;
+    bool isGuarded = 2;
+}
+
+message SetPrivateProperty {
+    string propertyName = 1;
+    bool isGuarded = 2;
+}
+
+message UpdatePrivateProperty {
+    string propertyName = 1;
+    BinaryOperator op = 2;
+}
+
+message CallPrivateMethod {
+    string methodName = 1;
+    bool isGuarded = 2;
+}
+
+message CallPrivateMethodWithSpread {
+    string methodName = 1;
+    repeated bool spreads = 2;
+    bool isGuarded = 3;
+}
+
+message GetSuperProperty {
+    string propertyName = 1;
+}
+
+message SetSuperProperty {
+    string propertyName = 1;
+}
+
+message GetComputedSuperProperty {
+}
+
+message SetComputedSuperProperty {
+}
+
+message UpdateSuperProperty {
+    string propertyName = 1;
+    BinaryOperator op = 2;
+}
+
+message LoadNewTarget {
+}
+
+message Explore {
+    string id = 1;
+    int64 rngSeed = 2;
+}
+
+message Probe {
+    string id = 1;
+}
+
+message Fixup {
+    string id = 1;
+    string action = 2;
+    string originalOperation = 3;
+    bool hasOutput = 4;
+}
+
+message BeginWith {
+}
+
+message EndWith {
+}
+
+message BeginIf {
+    bool inverted = 1;
+}
+
+message BeginElse {
+}
+
+message EndIf {
+}
+
+message BeginSwitch {
+}
+
+message BeginSwitchCase {
+}
+
+message BeginSwitchDefaultCase {
+}
+
+message SwitchBreak {
+}
+
+message EndSwitchCase {
+    bool fallsThrough = 1;
+}
+
+message EndSwitch {
+}
+
+message BeginWhileLoopHeader {
+}
+
+message BeginWhileLoopBody {
+}
+
+message EndWhileLoop {
+}
+
+message BeginDoWhileLoopBody {
+}
+
+message BeginDoWhileLoopHeader {
+}
+
+message EndDoWhileLoop {
+}
+
+message BeginForLoopInitializer {
+}
+
+message BeginForLoopCondition {
+}
+
+message BeginForLoopAfterthought {
+}
+
+message BeginForLoopBody {
+}
+
+message EndForLoop {
+}
+
+message BeginForLoop {
+    enum ForInOfLoopType {
+        FOR_OF = 0;
+        FOR_IN = 1;
+    }
+    enum HeaderType {
+        SIMPLE = 0;
+        DESTRUCT = 1;
+    }
+    enum UsingType {
+        NONE = 0;
+        USING = 1;
+        AWAIT_USING = 2;
+    }
+
+    ForInOfLoopType loopType = 1;
+    bool isAsync = 2;
+    HeaderType headerType = 3;
+
+    UsingType usingType = 7;
+    FuzzILDestructuringPattern pattern = 8;
+}
+
+message BeginRepeatLoop {
+    int64 iterations = 1;
+    bool exposesLoopCounter = 2;
+}
+
+message EndRepeatLoop {
+}
+
+message LoopBreak {
+}
+
+message LoopContinue {
+}
+
+message BeginTry {
+}
+
+message BeginCatch {
+}
+
+message BeginFinally {
+}
+
+message EndTryCatchFinally {
+}
+
+message ThrowException {
+}
+
+message BeginCodeString {
+}
+
+message EndCodeString {
+}
+
+message BeginBlockStatement {
+}
+
+message EndBlockStatement {
+}
+
+message BlockBreak {
+}
+
+message Nop {
+}
+
+message Print {
+}
+
+message BeginWasmModule {
+}
+
+message EndWasmModule {
+  bool hasStartFunction = 1;
+}
+
+message CreateWasmGlobal {
+  WasmGlobal wasmGlobal = 1;
+}
+
+message CreateWasmMemory {
+  WasmMemory wasmMemory = 1;
+}
+
+message CreateWasmTable {
+  WasmILType elementType = 1;
+  int64 minSize = 2;
+  optional int64 maxSize = 3;
+  bool isTable64 = 4;
+}
+
+message CreateWasmJSTag {
+}
+
+message CreateWasmTag {
+    repeated WasmILType parameterTypes = 1;
+}
+
+message WrapSuspending {
+}
+
+message WrapPromising {
+}
+
+message BindMethod {
+    string methodName = 1;
+}
+
+message BindFunction {
+}
+
+// Wasm Operations
+
+message Consti64 {
+  int64 value = 1;
+}
+
+message Consti32 {
+  int32 value = 1;
+}
+
+message Constf32 {
+  float value = 1;
+}
+
+message Constf64 {
+  double value = 1;
+}
+
+message WasmReturn {
+}
+
+// We only serialize the wasm types as the rest would be overkill and are not needed.
+enum WasmValueType {
+  I32 = 0;
+  I64 = 1;
+  F32 = 2;
+  F64 = 3;
+  PACKED_I8 = 4;
+  PACKED_I16 = 5;
+  SIMD128 = 6;
+  // Fuzzilli-specific types
+  FUNCTIONDEF = 7;  // Stands for the type of a funcref table with function indices.
+  NOTHING = 8;
+}
+
+enum WasmReferenceTypeKind {
+  INDEX = 0;
+  EXTERNREF = 1;
+  FUNCREF = 2;
+  EXNREF = 3;
+  I31REF = 4;
+  ANYREF = 5;
+  EQREF = 6;
+  STRUCTREF = 7;
+  ARRAYREF = 8;
+  NONEREF = 9;
+  NOEXTERNREF = 10;
+  NOFUNCREF = 11;
+  NOEXNREF = 12;
+  JSSTRINGREF = 13;
+}
+
+message WasmReferenceType {
+  WasmReferenceTypeKind kind = 1;
+  bool nullability = 2;
+}
+
+message WasmILType {
+  oneof Type {
+    WasmValueType valueType = 1;
+    WasmReferenceType refType = 2;
+  }
+}
+
+message BeginWasmFunction {
+  int32 parameterCount = 1;
+}
+
+message EndWasmFunction {
+  int32 outputCount = 1;
+}
+
+message WasmJsCall {
+  int32 parameterCount = 1;
+  int32 outputCount = 2;
+}
+
+message Wasmi32CompareOp {
+    int32 compareOperator = 1;
+}
+
+message Wasmi64CompareOp {
+    int32 compareOperator = 1;
+}
+
+message Wasmf32CompareOp {
+    int32 compareOperator = 1;
+}
+
+message Wasmf64CompareOp {
+    int32 compareOperator = 1;
+}
+
+message Wasmi64BinOp {
+    WasmIntegerBinaryOperator op = 1;
+}
+
+message Wasmi32BinOp {
+    WasmIntegerBinaryOperator op = 1;
+}
+
+message Wasmi64UnOp {
+    WasmIntegerUnaryOperator op = 1;
+}
+
+message Wasmi32UnOp {
+    WasmIntegerUnaryOperator op = 1;
+}
+
+message Wasmf64BinOp {
+    WasmFloatBinaryOperator op = 1;
+}
+
+message Wasmf32BinOp {
+    WasmFloatBinaryOperator op = 1;
+}
+
+message Wasmf64UnOp {
+    WasmFloatUnaryOperator op = 1;
+}
+
+message Wasmf32UnOp {
+    WasmFloatUnaryOperator op = 1;
+}
+
+message Wasmi32EqualZero {
+}
+
+message Wasmi64EqualZero {
+}
+
+// Numerical Conversion Operations
+
+message WasmWrapi64Toi32 {
+}
+
+message WasmTruncatef32Toi32 {
+    bool isSigned = 1;
+}
+
+message WasmTruncatef64Toi32 {
+    bool isSigned = 1;
+}
+
+message WasmExtendi32Toi64 {
+    bool isSigned = 1;
+}
+
+message WasmTruncatef32Toi64 {
+    bool isSigned = 1;
+}
+
+message WasmTruncatef64Toi64 {
+    bool isSigned = 1;
+}
+
+message WasmConverti32Tof32 {
+    bool isSigned = 1;
+}
+
+message WasmTruncatei64Tof32 {
+    bool isSigned = 1;
+}
+
+message WasmDemotef64Tof32 {
+}
+
+message WasmConverti32Tof64 {
+    bool isSigned = 1;
+}
+
+message WasmConverti64Tof64 {
+    bool isSigned = 1;
+}
+
+message WasmConverti64Tof32 {
+    bool isSigned = 1;
+}
+
+
+message WasmPromotef32Tof64 {
+}
+
+message WasmReinterpretf32Asi32 {
+}
+
+message WasmReinterpretf64Asi64 {
+}
+
+message WasmReinterpreti32Asf32 {
+}
+
+message WasmReinterpreti64Asf64 {
+}
+
+message WasmSignExtend8Intoi32 {
+}
+
+message WasmSignExtend16Intoi32 {
+}
+
+message WasmSignExtend8Intoi64 {
+}
+
+message WasmSignExtend16Intoi64 {
+}
+
+message WasmSignExtend32Intoi64 {
+}
+
+message WasmTruncateSatf32Toi32 {
+    bool isSigned = 1;
+}
+
+message WasmTruncateSatf64Toi32 {
+    bool isSigned = 1;
+}
+
+message WasmTruncateSatf32Toi64 {
+    bool isSigned = 1;
+}
+
+message WasmTruncateSatf64Toi64 {
+    bool isSigned = 1;
+}
+
+message WasmGlobal {
+  bool isMutable = 1;
+  oneof wasmGlobal {
+    int32 valuei32 = 2;
+    int64 valuei64 = 3;
+    float valuef32 = 4;
+    double valuef64 = 5;
+    WasmReferenceTypeKind nullref = 6;
+    int64 funcref = 7;
+    WasmILType imported = 8;
+  }
+}
+
+message WasmMemory {
+  int64 minPages = 1;
+  optional int64 maxPages = 2;
+  bool isShared = 3;
+  bool isMemory64 = 4;
+}
+
+message WasmDefineGlobal {
+   WasmGlobal wasmGlobal = 1;
+}
+
+message WasmSignature {
+  repeated WasmILType parameterTypes = 1;
+  repeated WasmILType outputTypes = 2;
+}
+
+message WasmDefineTable {
+  WasmILType elementType = 1;
+  int64 minSize = 2;
+  optional int64 maxSize = 3;
+  bool isTable64 = 5;
+}
+
+message WasmDefineMemory {
+  WasmMemory wasmMemory = 1;
+}
+
+message WasmLoadGlobal {
+}
+
+message WasmStoreGlobal {
+}
+
+message WasmTableGet {
+  WasmILType elementType = 1;
+}
+
+message WasmTableSet {
+}
+
+message WasmTableSize {
+}
+
+message WasmTableGrow {
+}
+
+message WasmCallIndirect {
+  int32 parameterCount = 1;
+  int32 outputCount = 2;
+}
+
+message WasmCallDirect {
+  int32 parameterCount = 1;
+  int32 outputCount = 2;
+}
+
+message WasmCallRef {
+  int32 parameterCount = 1;
+  int32 outputCount = 2;
+}
+
+message WasmReturnCallRef {
+  int32 parameterCount = 1;
+}
+
+message WasmReturnCallDirect {
+  int32 parameterCount = 1;
+}
+
+message WasmReturnCallIndirect {
+  int32 parameterCount = 1;
+}
+
+enum WasmMemoryLoadType {
+  I32_LOADMEM = 0;
+  I64_LOADMEM = 1;
+  F32_LOADMEM = 2;
+  F64_LOADMEM = 3;
+  I32_LOADMEM_8S = 4;
+  I32_LOADMEM_8U = 5;
+  I32_LOADMEM_16S = 6;
+  I32_LOADMEM_16U = 7;
+  I64_LOADMEM_8S = 8;
+  I64_LOADMEM_8U = 9;
+  I64_LOADMEM_16S = 10;
+  I64_LOADMEM_16U = 11;
+  I64_LOADMEM_32S = 12;
+  I64_LOADMEM_32U = 13;
+}
+
+message WasmMemoryLoad {
+  WasmMemoryLoadType loadType = 1;
+  int64 staticOffset = 2;
+}
+
+enum WasmMemoryStoreType {
+  I32_STOREMEM = 0;
+  I64_STOREMEM = 1;
+  F32_STOREMEM = 2;
+  F64_STOREMEM = 3;
+  I32_STOREMEM_8 = 4;
+  I32_STOREMEM_16 = 5;
+  I64_STOREMEM_8 = 6;
+  I64_STOREMEM_16 = 7;
+  I64_STOREMEM_32 = 8;
+  S128_STOREMEM = 9;
+}
+
+message WasmMemoryStore {
+  WasmMemoryStoreType storeType = 1;
+  int64 staticOffset = 2;
+}
+
+message WasmMemorySize {
+}
+
+message WasmMemoryGrow {
+}
+
+message WasmMemoryFill {
+}
+
+message WasmBeginBlock {
+  int32 parameterCount = 1;
+}
+
+message WasmEndBlock {
+  int32 outputCount = 1;
+}
+
+message WasmBeginLoop {
+  int32 parameterCount = 1;
+}
+
+message WasmEndLoop {
+  int32 outputCount = 1;
+}
+
+enum WasmCatchKind {
+  NO_REF = 0;
+  REF = 1;
+  ALL_NO_REF = 2;
+  ALL_REF = 3;
+}
+
+message Wasmi64WideBinOp {
+    WasmWideBinaryOperator op = 1;
+}
+
+enum WasmWideBinaryOperator {
+    WASM_ADD128 = 0;
+    WASM_SUB128 = 1;
+}
+
+message Wasmi64WideMulOp {
+    WasmWideMulOperator op = 1;
+}
+
+enum WasmWideMulOperator {
+    WASM_MUL_WIDE_S = 0;
+    WASM_MUL_WIDE_U = 1;
+}
+
+message WasmBeginTryTable {
+  int32 parameterCount = 1;
+  repeated WasmCatchKind catches = 2;
+}
+
+message WasmEndTryTable {
+  int32 outputCount = 1;
+}
+
+message WasmBeginTry {
+    int32 parameterCount = 1;
+}
+
+message WasmBeginCatchAll {
+    int32 blockOutputCount = 1;
+}
+
+message WasmBeginCatch {
+    int32 blockOutputCount = 1;
+    int32 labelParameterCount = 2;
+}
+
+message WasmEndTry {
+    int32 blockOutputCount = 1;
+}
+
+message WasmBeginTryDelegate {
+    int32 parameterCount = 1;
+}
+
+message WasmEndTryDelegate {
+    int32 outputCount = 1;
+}
+
+message WasmThrow {
+}
+
+message WasmThrowRef {
+}
+
+message WasmRethrow {
+}
+
+message WasmDefineTag {
+}
+
+message WasmBranch {
+}
+
+enum WasmBranchHint {
+    BRANCHHINT_NONE = 0;
+    BRANCHHINT_LIKELY = 1;
+    BRANCHHINT_UNLIKELY = 2;
+}
+
+message WasmBranchIf {
+  WasmBranchHint hint = 2;
+}
+
+message WasmBranchTable {
+  uint32 valueCount = 2;
+}
+
+message WasmReassign {
+}
+
+message WasmBeginIf {
+  int32 parameterCount = 1;
+  bool inverted = 3;
+  WasmBranchHint hint = 4;
+}
+
+message WasmBeginElse {
+  int32 parameterCount = 1;
+  int32 outputCount = 2;
+}
+
+message WasmEndIf {
+  int32 outputCount = 1;
+}
+
+message WasmNop {
+}
+
+message WasmUnreachable {
+}
+
+message WasmSelect {
+}
+
+message ConstSimd128 {
+    repeated uint32 value = 1;
+}
+
+message WasmSimd128Compare {
+    uint32 shape = 1;
+    uint32 compareOperator = 2;
+}
+
+message WasmSimd128IntegerUnOp {
+    uint32 shape = 1;
+    int32 unaryOperator = 2;
+}
+
+message WasmSimd128IntegerBinOp {
+    uint32 shape = 1;
+    int32 binaryOperator = 2;
+}
+
+message WasmSimd128IntegerTernaryOp {
+    uint32 shape = 1;
+    int32 opcode = 2;
+}
+
+message WasmSimd128FloatUnOp {
+    uint32 shape = 1;
+    int32 unaryOperator = 2;
+}
+
+message WasmSimd128FloatBinOp {
+    uint32 shape = 1;
+    int32 binaryOperator = 2;
+}
+
+message WasmSimd128FloatTernaryOp {
+    uint32 shape = 1;
+    int32 opcode = 2;
+}
+
+enum WasmSimdSplatKind {
+    I8x16 = 0;
+    I16x8 = 1;
+    I32x4 = 2;
+    I64x2 = 3;
+    F32x4 = 4;
+    F64x2 = 5;
+}
+
+message WasmSimdSplat {
+    WasmSimdSplatKind kind = 1;
+}
+
+enum WasmSimdExtractLaneKind {
+    EXTRACTI8x16S = 0;
+    EXTRACTI8x16U = 1;
+    EXTRACTI16x8S = 2;
+    EXTRACTI16x8U = 3;
+    EXTRACTI32x4 = 4;
+    EXTRACTI64x2 = 5;
+    EXTRACTF32x4 = 6;
+    EXTRACTF64x2 = 7;
+}
+
+message WasmSimdExtractLane {
+    WasmSimdExtractLaneKind kind = 1;
+    uint32 lane = 2;
+}
+
+enum WasmSimdReplaceLaneKind {
+    REPLACEI8x16 = 0;
+    REPLACEI16x8 = 1;
+    REPLACEI32x4 = 2;
+    REPLACEI64x2 = 3;
+    REPLACEF32x4 = 4;
+    REPLACEF64x2 = 5;
+}
+
+message WasmSimdReplaceLane {
+    WasmSimdReplaceLaneKind kind = 1;
+    uint32 lane = 2;
+}
+
+enum WasmSimdStoreLaneKind {
+  STORE8 = 0;
+  STORE16 = 1;
+  STORE32 = 2;
+  STORE64 = 3;
+}
+
+message WasmSimdStoreLane {
+  WasmSimdStoreLaneKind kind = 1;
+  int64 staticOffset = 2;
+  uint32 lane = 3;
+}
+
+enum WasmSimdLoadLaneKind {
+  LOAD8 = 0;
+  LOAD16 = 1;
+  LOAD32 = 2;
+  LOAD64 = 3;
+}
+
+message WasmSimdLoadLane {
+  WasmSimdLoadLaneKind kind = 1;
+  int64 staticOffset = 2;
+  uint32 lane = 3;
+}
+
+enum WasmSimdLoadKind {
+  LOADS128 = 0;
+  LOAD8x8S = 1;
+  LOAD8x8U = 2;
+  LOAD16x4S = 3;
+  LOAD16x4U = 4;
+  LOAD32x2S = 5;
+  LOAD32x2U = 6;
+  LOAD8SPLAT = 7;
+  LOAD16SPLAT = 8;
+  LOAD32SPLAT = 9;
+  LOAD64SPLAT = 10;
+  LOAD32ZERO = 11;
+  LOAD64ZERO = 12;
+}
+
+message WasmSimdLoad {
+  WasmSimdLoadKind kind = 1;
+  int64 staticOffset = 2;
+}
+
+
+message WasmBeginTypeGroup {
+}
+
+message WasmEndTypeGroup {
+}
+
+message WasmDefineSignatureType {
+    repeated WasmILType parameterTypes = 1;
+    repeated WasmILType outputTypes = 2;
+    bool hasSuperType = 3;
+    bool isFinal = 4;
+}
+
+message WasmDefineAdHocSignatureType {
+    repeated WasmILType parameterTypes = 1;
+    repeated WasmILType outputTypes = 2;
+}
+
+message WasmDefineAdHocModuleSignatureType {
+    repeated WasmILType parameterTypes = 1;
+    repeated WasmILType outputTypes = 2;
+}
+
+message WasmDefineArrayType {
+    WasmILType elementType = 1;
+    bool mutability = 2;
+    bool hasSuperType = 3;
+    bool isFinal = 4;
+}
+
+message WasmStructField {
+    WasmILType type = 1;
+    bool mutability = 2;
+}
+
+message WasmDefineStructType {
+    repeated WasmStructField fields = 1;
+    bool hasSuperType = 2;
+    bool isFinal = 3;
+    bool hasDescribes = 4;
+}
+
+message WasmDefineForwardOrSelfReference {
+}
+
+message WasmResolveForwardReference {
+}
+
+message WasmArrayNewFixed {
+}
+
+message WasmArrayNewDefault {
+}
+
+message WasmArrayLen {
+}
+
+message WasmArrayGet {
+    bool isSigned = 1;
+}
+
+message WasmArraySet {
+}
+
+message WasmStructNewDefault {
+}
+
+message WasmStructNew {
+}
+
+message WasmStructGet {
+    int32 fieldIndex = 1;
+    bool isSigned = 2;
+}
+
+message WasmStructSet {
+    int32 fieldIndex = 1;
+}
+
+message WasmRefNull {
+    optional WasmILType type = 1;
+}
+
+message WasmRefIsNull {
+}
+
+message WasmRefFunc {
+}
+
+message WasmRefEq {
+}
+
+message WasmRefTest {
+    WasmILType type = 1;
+}
+
+message WasmRefCast {
+    WasmILType type = 1;
+}
+
+message WasmBranchOnNull {
+}
+
+message WasmBranchOnCast {
+    WasmILType type = 1;
+}
+
+message WasmBranchOnCastFail {
+    WasmILType type = 1;
+}
+
+message WasmBranchOnNonNull {
+}
+
+message WasmRefI31 {
+    bool isShared = 1;
+}
+
+message WasmI31Get {
+    bool isSigned = 1;
+}
+
+enum WasmAtomicLoadType {
+  I32_LOAD = 0;
+  I64_LOAD = 1;
+  I32_LOAD_8U = 2;
+  I32_LOAD_16U = 3;
+  I64_LOAD_8U = 4;
+  I64_LOAD_16U = 5;
+  I64_LOAD_32U = 6;
+}
+
+enum WasmAtomicStoreType {
+  I32_STORE = 0;
+  I64_STORE = 1;
+  I32_STORE_8 = 2;
+  I32_STORE_16 = 3;
+  I64_STORE_8 = 4;
+  I64_STORE_16 = 5;
+  I64_STORE_32 = 6;
+}
+
+enum WasmMemoryOrdering {
+  SEQUENTIALLY_CONSISTENT = 0;
+  ACQUIRE_RELEASE = 1;
+}
+
+message WasmAtomicLoad {
+  WasmAtomicLoadType loadType = 1;
+  int64 offset = 2;
+  WasmMemoryOrdering ordering = 3;
+}
+
+message WasmAtomicStore {
+  WasmAtomicStoreType storeType = 1;
+  int64 offset = 2;
+  WasmMemoryOrdering ordering = 3;
+}
+
+enum WasmAtomicRMWType {
+    I32_ADD = 0;
+    I64_ADD = 1;
+    I32_ADD_8U = 2;
+    I32_ADD_16U = 3;
+    I64_ADD_8U = 4;
+    I64_ADD_16U = 5;
+    I64_ADD_32U = 6;
+    I32_SUB = 7;
+    I64_SUB = 8;
+    I32_SUB_8U = 9;
+    I32_SUB_16U = 10;
+    I64_SUB_8U = 11;
+    I64_SUB_16U = 12;
+    I64_SUB_32U = 13;
+    I32_AND = 14;
+    I64_AND = 15;
+    I32_AND_8U = 16;
+    I32_AND_16U = 17;
+    I64_AND_8U = 18;
+    I64_AND_16U = 19;
+    I64_AND_32U = 20;
+    I32_OR = 21;
+    I64_OR = 22;
+    I32_OR_8U = 23;
+    I32_OR_16U = 24;
+    I64_OR_8U = 25;
+    I64_OR_16U = 26;
+    I64_OR_32U = 27;
+    I32_XOR = 28;
+    I64_XOR = 29;
+    I32_XOR_8U = 30;
+    I32_XOR_16U = 31;
+    I64_XOR_8U = 32;
+    I64_XOR_16U = 33;
+    I64_XOR_32U = 34;
+    I32_XCHG = 35;
+    I64_XCHG = 36;
+    I32_XCHG_8U = 37;
+    I32_XCHG_16U = 38;
+    I64_XCHG_8U = 39;
+    I64_XCHG_16U = 40;
+    I64_XCHG_32U = 41;
+}
+
+message WasmAtomicRMW {
+    WasmAtomicRMWType op = 1;
+    int64 offset = 2;
+    WasmMemoryOrdering ordering = 3;
+}
+
+enum WasmAtomicCmpxchgType {
+    I32_CMPXCHG = 0;
+    I64_CMPXCHG = 1;
+    I32_CMPXCHG_8U = 2;
+    I32_CMPXCHG_16U = 3;
+    I64_CMPXCHG_8U = 4;
+    I64_CMPXCHG_16U = 5;
+    I64_CMPXCHG_32U = 6;
+}
+
+message WasmAtomicCmpxchg {
+    WasmAtomicCmpxchgType op = 1;
+    int64 offset = 2;
+    WasmMemoryOrdering ordering = 3;
+}
+
+message WasmAnyConvertExtern {
+}
+
+message WasmExternConvertAny {
+}
+
+message WasmDefineDataSegment {
+  bytes segment = 1;
+}
+
+message WasmDropDataSegment {
+}
+
+message WasmMemoryInit {
+}
+
+message WasmMemoryCopy {
+}
+
+message WasmDefineElementSegment {
+    uint32 size = 1;
+}
+
+message WasmDropElementSegment {
+}
+
+message WasmTableInit {
+}
+
+message WasmTableCopy {
+}
+
+message BeginBundleScript {
+}
+
+message EndBundleScript {
+}
+
+enum JSType {
+  NUMBER = 0;
+  BIGINT = 1;
+  OBJECT = 2;
+  UNDEFINED = 3;
+  ANYTHING = 4;
+}
+
+message JSSignature {
+  repeated JSType parameterTypes = 1;
+  JSType returnType = 2;
+}
+
+message WasmFunctionExport {
+  string name = 1;
+  JSSignature signature = 2;
+}
+
+message WasmModuleMetadata {
+  repeated WasmFunctionExport functions = 1;
+  repeated string globals = 2;
+  repeated string tables = 3;
+  repeated string tags = 4;
+  repeated string memories = 5;
+}
+
+message RawWasmModule {
+  bytes bytes = 1;
+  WasmModuleMetadata metadata = 2;
+}
+
+message BeginBundleModule {
+    string moduleName = 1;
+}
+
+message EndBundleModule {
+    string moduleName = 1;
+}
+
+message ExportVariables {
+    repeated string exportNames = 1;
+}
+
+message ImportVariables {
+    repeated string importNames = 1;
+}
+
+message ImportNamespace {
+    bool isDeferred = 1;
+}
+
+message DynamicImport {
+    bool isDeferred = 1;
+}
+
+message BeginBundleModuleEntryPoint {
+}
+
+message EndBundleModuleEntryPoint {
+}
+
+message CreateMap {
+    optional string keyGroupName = 1;
+    optional string valueGroupName = 2;
+}
+
+message WasmRefAsNonNull {
+}
+
+message FuzzILDestructuringPattern {
+    oneof pattern {
+        ObjectPattern objectPattern = 1;
+        ArrayPattern arrayPattern = 2;
+    }
+
+    message ObjectPattern {
+        repeated ObjectProperty properties = 1;
+        bool hasRestElement = 2;
+    }
+
+    message Target {
+        oneof value {
+            Empty flatBinding = 1;                  // e.g. `[a] = arr` or `{a} = obj`
+            FuzzILDestructuringPattern pattern = 2; // e.g. `[{a}] = arr`
+            string property = 3;                    // e.g. `[obj.prop] = arr`
+            int64 element = 4;                      // e.g. `[arr[0]] = arr`
+            Empty computedProperty = 5;             // e.g. `[obj[key]] = arr`
+            string superProperty = 6;               // e.g. `[super.prop] = arr`
+            int64 superElement = 7;                 // e.g. `[super[0]] = arr`
+            Empty superComputedProperty = 8;        // e.g. `[super[key]] = arr`
+            string privateProperty = 9;             // e.g. `[this.#prop] = arr`
+        }
+    }
+
+    message ObjectProperty {
+        // The key is either a known string, or a computed key provided as an input variable
+        oneof key {
+            string stringKey = 1;
+            Empty computedKey = 2;
+        }
+
+        Target target = 3;
+        bool hasDefaultValue = 5;
+    }
+
+    message ArrayPattern {
+        repeated ArrayElement elements = 1;
+        Target restTarget = 2; // Unset means no rest element
+    }
+
+    message ArrayElement {
+        Target target = 1; // Unset means it is an elision (e.g. `[,]`)
+        bool hasDefaultValue = 2;
+    }
+}
+
+message Destruct {
+    FuzzILDestructuringPattern pattern = 1;
+}
+
+message DestructAndReassign {
+    FuzzILDestructuringPattern pattern = 1;
+}
+
+message DeclarePendingBundleModule {
+    string moduleName = 1;
+    repeated string exportNames = 2;
+}
+
+message BeginPendingBundleModule {
+}
+
+message EndPendingBundleModule {
+}
+
+message WasmJSStringLength {}
+message WasmJSStringFromCharCodeArray {}
+message WasmJSStringFromCharCode {}
+message WasmJSStringFromCodePoint {}
+message WasmJSStringCharCodeAt {}
+message WasmJSStringCodePointAt {}
+message WasmJSStringIntoCharCodeArray {}
+message WasmJSStringCast {}
+message WasmJSStringTest {}
+message WasmJSStringConcat {}
+message WasmJSStringSubstring {}
+message WasmJSStringEquals {}
+message WasmJSStringCompare {}
+message WasmStringConstant {
+    string value = 1;
+}

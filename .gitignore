@@ -1,0 +1,4 @@
+.build/
+*.prof
+disable_coredump.so
+node_modules/

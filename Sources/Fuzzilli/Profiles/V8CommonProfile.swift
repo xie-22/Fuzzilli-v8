@@ -1,0 +1,1557 @@
+// Copyright 2019 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+import OrderedCollections
+
+extension ILType {
+    public static let jsD8 = ILType.object(ofGroup: "D8", withProperties: ["test"], withMethods: [])
+
+    public static let jsD8Test = ILType.object(
+        ofGroup: "D8Test", withProperties: ["FastCAPI"], withMethods: [])
+
+    public static let jsD8FastCAPI = ILType.object(
+        ofGroup: "D8FastCAPI", withProperties: [],
+        withMethods: ["throw_no_fallback", "add_32bit_int"])
+
+    public static let jsD8FastCAPIConstructor = ILType.constructor([] => .jsD8FastCAPI)
+
+    public static let gcTypeEnum = ILType.enumeration(
+        ofName: "gcType", withValues: ["minor", "major"])
+    public static let gcExecutionEnum = ILType.enumeration(
+        ofName: "gcExecution", withValues: ["async", "sync"])
+
+    public static let jsWorker = object(
+        ofGroup: "Worker",
+        withMethods: ["postMessage", "getMessage", "terminate", "terminateAndWait"])
+    public static let jsWorkerConstructor =
+        constructor([.jsAnything, .object()] => jsWorker)
+        + object(ofGroup: "WorkerConstructor", withProperties: ["prototype"])
+}
+
+public let gcOptions = ObjectGroup(
+    name: "GCOptions",
+    instanceType: .object(
+        ofGroup: "GCOptions", withProperties: ["type", "execution"], withMethods: []),
+    properties: [
+        "type": .gcTypeEnum,
+        "execution": .gcExecutionEnum,
+    ],
+    methods: [:])
+
+extension ObjectGroup {
+    public static let jsWorkers = ObjectGroup(
+        name: "Worker",
+        instanceType: .jsWorker,
+        properties: [:],
+        methods: [
+            "postMessage": [.jsAnything] => .undefined,
+            "getMessage": [] => .jsAnything,
+            "terminate": [] => .undefined,
+            "terminateAndWait": [] => .undefined,
+        ]
+    )
+
+    public static let jsWorkerPrototype =
+        ObjectGroup.createPrototypeObjectGroup(jsWorkers, constructor: .jsWorkerConstructor)
+
+    public static let jsWorkerConstructors = ObjectGroup(
+        name: "WorkerConstructor",
+        constructorPath: "Worker",
+        instanceType: .jsWorkerConstructor,
+        properties: [
+            "prototype": jsWorkerPrototype.instanceType
+        ],
+        methods: [:]
+    )
+}
+
+public let fastCallables: [(group: ILType, method: String)] = [
+    (group: .jsD8FastCAPI, method: "throw_no_fallback"),
+    (group: .jsD8FastCAPI, method: "add_32bit_int"),
+]
+
+// Insert random GC calls throughout our code.
+public let V8GcGenerator = CodeGenerator("GcGenerator") { b in
+    let gc = b.createNamedVariable(forBuiltin: "gc")
+
+    // `gc()` takes a `type` parameter. If the value is 'async', gc() returns a
+    // Promise. We currently do not really handle this other than typing the
+    // return of gc to .undefined | .jsPromise. One could either chain a .then
+    // or create two wrapper functions that are differently typed such that
+    // fuzzilli always knows what the type of the return value is.
+    b.callFunction(
+        gc,
+        withArgs: b.findOrGenerateArguments(
+            forSignature: b.fuzzer.environment.type(ofBuiltin: "gc").signature!))
+}
+
+public let V8AllocationTimeoutGenerator = CodeGenerator("AllocationTimeoutGenerator") { b in
+    // Repeated GCs are expensive, so only rarely use an interval.
+    let interval = probability(0.1) ? Int64.random(in: 100...10000) : -1
+    let timeout = Int64.random(in: 0...(Bool.random() ? 10 : 100))  // prefer small values
+    b.eval("%SetAllocationTimeout(%@, %@)", with: [b.loadInt(interval), b.loadInt(timeout)])
+}
+
+public let V8MajorGcGenerator = CodeGenerator("MajorGcGenerator") { b in
+    // Differently to `gc()`, this intrinsic is registered with less effects, preventing fewer
+    // optimizations in V8's optimizing compilers.
+    b.eval("%MajorGCForCompilerTesting()")
+}
+
+public let ForceJITCompilationThroughLoopGenerator = CodeGenerator(
+    "ForceJITCompilationThroughLoopGenerator", inputs: .required(.function())
+) { b, f in
+    assert(b.type(of: f).Is(.function()))
+    let arguments = b.randomArguments(forCalling: f)
+
+    b.buildRepeatLoop(n: 100) { _ in
+        b.callFunction(f, withArgs: arguments)
+    }
+}
+
+// Choose argument lists for four function calls of the same function with
+// interesting optimization patterns.
+func chooseArgumentLists(_ b: ProgramBuilder, forCalling f: Variable) -> (
+    [Variable], [Variable], [Variable], [Variable]
+) {
+    var reusePool: [[Variable]] = [b.randomArguments(forCalling: f)]
+    let reuseProbabilities = [1.0, 0.9, 0.9, 0.5]
+
+    let argumentLists = reuseProbabilities.map { p in
+        if probability(p) {
+            return reusePool.randomElement()!
+        } else {
+            reusePool.append(b.randomArguments(forCalling: f))
+            return reusePool.last!
+        }
+    }
+
+    assert(argumentLists.count == 4)
+    return (argumentLists[0], argumentLists[1], argumentLists[2], argumentLists[3])
+}
+
+private func forceCompilationGenerator(_ generatorName: String, optimizeName: String)
+    -> CodeGenerator
+{
+    return CodeGenerator(generatorName, inputs: .required(.function())) { b, f in
+        assert(b.type(of: f).Is(.function()))
+        let (args1, args2, args3, args4) = chooseArgumentLists(b, forCalling: f)
+
+        let guardCalls = probability(0.5)
+
+        b.callFunction(f, withArgs: args1, guard: guardCalls)
+
+        b.eval("%PrepareFunctionForOptimization(%@)", with: [f])
+
+        b.callFunction(f, withArgs: args2, guard: guardCalls)
+        b.callFunction(f, withArgs: args3, guard: guardCalls)
+
+        b.eval("%\(optimizeName)(%@)", with: [f])
+
+        b.callFunction(f, withArgs: args4, guard: guardCalls)
+    }
+}
+
+public let ForceTurboFanCompilationGenerator = forceCompilationGenerator(
+    "ForceTurboFanCompilationGenerator", optimizeName: "OptimizeFunctionOnNextCall")
+
+public let ForceMaglevCompilationGenerator = forceCompilationGenerator(
+    "ForceMaglevCompilationGenerator", optimizeName: "OptimizeMaglevOnNextCall")
+
+// Create a loop and force OSR in one of the iterations.
+public let ForceOsrGenerator = CodeGenerator(
+    "ForceOsrGenerator",
+    [
+        GeneratorStub(
+            "ForceOsrBeginGenerator",
+            inContext: .single(.javascript),
+            provides: [.javascript]
+        ) { b in
+            let numIterations = Int.random(in: 2...50)
+            let loopVar = b.emit(BeginRepeatLoop(iterations: numIterations)).innerOutput(0)
+            let condition = b.compare(
+                loopVar, with: b.loadInt(Int64.random(in: 0..<Int64(numIterations))),
+                using: .equal)
+            b.buildIf(condition) {
+                if probability(0.8) {
+                    b.eval("%OptimizeOsr()")
+                } else {
+                    b.eval("%OptimizeOsr(%@)", with: [b.loadInt(1)])
+                }
+            }
+        },
+        GeneratorStub(
+            "ForceOsrEndGenerator",
+            inContext: .single([.javascript])
+        ) { b in
+            b.emit(EndRepeatLoop())
+        },
+    ])
+
+public let TurbofanVerifyTypeGenerator = CodeGenerator("TurbofanVerifyTypeGenerator", inputs: .one)
+{ b, v in
+    b.eval("%VerifyType(%@)", with: [v])
+}
+
+public let WorkerGenerator = CodeGenerator("WorkerGenerator") { b in
+    let workerSignature = Signature(withParameterCount: Int.random(in: 0...3))
+
+    let workerFunction = b.buildWorkerFunction(
+        with: .parameters(workerSignature.parameters)
+    ) { args in
+        b.buildPrefix(n: 3)
+
+        let this = b.loadThis()
+
+        // Generate a random onmessage handler for incoming messages.
+        let onmessageFunction = b.buildPlainFunction(
+            with: .parameters(.object(withProperties: ["data"]))
+        ) { args in
+            // Encourage reading the object contained in the message.
+            b.getProperty("data", of: args[0])
+            b.buildRecursive(n: Int.random(in: 2...5))
+
+            // Signal done in worker. This shouldn't be minified away, since it changes the program behavior (the main thread is waiting for it, and without this, it will timeout).
+            let postMessage = b.createNamedVariable(forBuiltin: "postMessage")
+            b.callFunction(postMessage, withArgs: [b.randomJsVariable()])
+        }
+        b.setProperty("onmessage", of: this, to: onmessageFunction)
+
+        b.buildRecursive(n: Int.random(in: 3...10))
+    }
+    let workerConstructor = b.createNamedVariable(forBuiltin: "Worker")
+
+    let functionString = b.loadString("function")
+    let argumentsArray = b.createArray(with: b.randomArguments(forCalling: workerFunction))
+
+    let configObject = b.createObject(with: ["type": functionString, "arguments": argumentsArray])
+
+    let worker = b.construct(workerConstructor, withArgs: [workerFunction, configObject])
+
+    // Send message to start worker.
+    b.callMethod("postMessage", on: worker, withArgs: [b.randomJsVariable()])
+
+    b.build(n: 10)
+
+    // Wait for worker to finish. This might get minified away, but if having it is the only way the worker runs long enough, it shouldn't be.
+    b.callMethod("getMessage", on: worker, withArgs: [])
+}
+
+public let WasmStructGenerator = CodeGenerator("WasmStructGenerator") { b in
+    b.eval("%WasmStruct()", hasOutput: true)
+}
+
+public let WasmArrayGenerator = CodeGenerator("WasmArrayGenerator") { b in
+    b.eval("%WasmArray()", hasOutput: true)
+}
+
+public let SharedObjectGenerator = CodeGenerator("SharedObjectGenerator", inputs: .one) { b, v in
+    b.eval("%ShareObject(%@)", with: [v], hasOutput: true)
+}
+
+public let PretenureAllocationSiteGenerator = CodeGenerator(
+    "PretenureAllocationSiteGenerator", inputs: .required(.object())
+) { b, obj in
+    b.eval("%PretenureAllocationSite(%@)", with: [obj])
+}
+
+public let HoleNanGenerator = CodeGenerator("HoleNanGenerator") { b in
+    b.eval("%GetHoleNaN()", hasOutput: true)
+}
+
+public let UndefinedNanGenerator = CodeGenerator("UndefinedNanGenerator") { b in
+    b.eval("%GetUndefinedNaN()", hasOutput: true)
+}
+
+public let HeapNumberGenerator = CodeGenerator("HeapNumberGenerator", inputs: .preferred(.integer))
+{ b, value in
+    // This generator prefers an integer input as these have a high chance of being representable as
+    // a Smi, meaning that we often end up with a HeapNumber that didn't have to be materialized.
+    b.eval("%AllocateHeapNumberWithValue(%@)", with: [value], hasOutput: true)
+}
+
+public let StringShapeGenerator = CodeGenerator("StringShapeGenerator") { b in
+    withEqualProbability(
+        {
+            // Use one random input string (can be 1-byte or 2-byte etc.) and a predefined second
+            // string so that the string is guaranteed to be long enough for emitting a cons string.
+            let lhs = b.randomVariable(forUseAs: .jsString)
+            let rhs = b.loadString("ConsStringConcatenation")
+            b.hide(rhs)
+            b.eval("%ConstructConsString(%@, %@)", with: [lhs, rhs], hasOutput: true)
+        },
+        {
+            let str = b.loadString(
+                Bool.random() ? "Long enough 1-byte string" : "Long enoµgh 2-byte string")
+            b.hide(str)
+            let offset = b.loadInt(Int64.random(in: 1...5))
+            b.eval("%ConstructSlicedString(%@, %@)", with: [str, offset], hasOutput: true)
+        },
+        {
+            let str = b.randomVariable(forUseAs: .jsString)
+            b.eval("%ConstructInternalizedString(%@)", with: [str], hasOutput: true)
+        },
+        {
+            let str = b.loadString(
+                Bool.random() ? "Long enough 1-byte string" : "Long enoµgh 2-byte string")
+            b.hide(str)
+            b.eval("%ConstructThinString(%@)", with: [str], hasOutput: true)
+        }
+    )
+}
+
+public let MapTransitionFuzzer = ProgramTemplate("MapTransitionFuzzer") { b in
+    // This template is meant to stress the v8 Map transition mechanisms.
+    // Basically, it generates a bunch of CreateObject, GetProperty, SetProperty, FunctionDefinition,
+    // and CallFunction operations operating on a small set of objects and property names.
+
+    let propertyNames = b.fuzzer.environment.customProperties
+    assert(Set(propertyNames).isDisjoint(with: b.fuzzer.environment.customMethods))
+
+    // Use this as base object type. For one, this ensures that the initial map is stable.
+    // Moreover, this guarantees that when querying for this type, we will receive one of
+    // the objects we created and not e.g. a function (which is also an object).
+    assert(propertyNames.contains("a"))
+    let objType = ILType.object(withProperties: ["a"])
+
+    // Helper function to pick random properties and values.
+    func randomProperties(in b: ProgramBuilder) -> ([String], [Variable]) {
+        if !b.hasVisibleJsVariables {
+            // Use integer values if there are no visible variables, which should be a decent fallback.
+            b.loadInt(b.randomInt())
+        }
+
+        var properties = ["a"]
+        var values = [b.randomJsVariable()]
+        for _ in 0..<3 {
+            let property = chooseUniform(from: propertyNames)
+            guard !properties.contains(property) else { continue }
+            properties.append(property)
+            values.append(b.randomJsVariable())
+        }
+        assert(Set(properties).count == values.count)
+        return (properties, values)
+    }
+
+    // Temporarily overwrite the active code generators with the following generators...
+    let primitiveCodeGenerator = CodeGenerator(
+        "PrimitiveValue", produces: [.primitive], useInPrefix: true
+    ) { b in
+        // These should roughly correspond to the supported property representations of the engine.
+        withEqualProbability(
+            {
+                b.loadInt(b.randomInt())
+            },
+            {
+                b.loadFloat(b.randomFloat())
+            },
+            {
+                b.loadString(b.randomString())
+            })
+    }
+    let createObjectGenerator = CodeGenerator(
+        "CreateObject", produces: [.object()], useInPrefix: true
+    ) { b in
+        let (properties, values) = randomProperties(in: b)
+        let obj = b.createObject(
+            with: OrderedDictionary(uniqueKeysWithValues: zip(properties, values)))
+        assert(b.type(of: obj).Is(objType))
+    }
+    let objectMakerGenerator = CodeGenerator("ObjectMaker") { b in
+        let f = b.buildPlainFunction(with: b.randomParameters()) { args in
+            let (properties, values) = randomProperties(in: b)
+            let o = b.createObject(
+                with: OrderedDictionary(uniqueKeysWithValues: zip(properties, values)))
+            b.doReturn(o)
+        }
+        for _ in 0..<3 {
+            let obj = b.callFunction(f, withArgs: b.randomArguments(forCalling: f))
+            assert(b.type(of: obj).Is(objType))
+        }
+    }
+    let objectConstructorGenerator = CodeGenerator("ObjectConstructor") { b in
+        let c = b.buildConstructor(with: b.randomParameters()) { args in
+            let this = args[0]
+            let (properties, values) = randomProperties(in: b)
+            for (p, v) in zip(properties, values) {
+                b.setProperty(p, of: this, to: v)
+            }
+        }
+        for _ in 0..<3 {
+            let obj = b.construct(c, withArgs: b.randomArguments(forCalling: c))
+            assert(b.type(of: obj).Is(objType))
+        }
+    }
+    let objectClassGenerator = CodeGenerator("ObjectClassGenerator") { b in
+        let superclass =
+            b.hasVisibleJsVariables && probability(0.5)
+            ? b.randomVariable(ofType: .constructor()) : nil
+        let (properties, values) = randomProperties(in: b)
+        let cls = b.buildClassDefinition(withSuperclass: superclass) { cls in
+            for (p, v) in zip(properties, values) {
+                cls.addInstanceProperty(p, value: v)
+            }
+        }
+        for _ in 0..<3 {
+            let obj = b.construct(cls)
+            assert(b.type(of: obj).Is(objType))
+        }
+    }
+    let propertyLoadGenerator = CodeGenerator("PropertyLoad", inputs: .required(objType)) {
+        b, obj in
+        assert(b.type(of: obj).Is(objType))
+        b.getProperty(chooseUniform(from: propertyNames), of: obj)
+    }
+    let propertyStoreGenerator = CodeGenerator("PropertyStore", inputs: .required(objType)) {
+        b, obj in
+        assert(b.type(of: obj).Is(objType))
+        let numProperties = Int.random(in: 1...3)
+        for _ in 0..<numProperties {
+            b.setProperty(chooseUniform(from: propertyNames), of: obj, to: b.randomJsVariable())
+        }
+    }
+    let propertyConfigureGenerator = CodeGenerator("PropertyConfigure", inputs: .required(objType))
+    { b, obj in
+        assert(b.type(of: obj).Is(objType))
+        b.configureProperty(
+            chooseUniform(from: propertyNames), of: obj, usingFlags: PropertyFlags.random(),
+            as: .value(b.randomJsVariable()))
+    }
+    let functionDefinitionGenerator = CodeGenerator("FunctionDefinition") { b in
+        // We use either a randomly generated signature or a fixed on that ensures we use our object type frequently.
+        var parameters = b.randomParameters()
+        let haveVisibleObjects = b.visibleVariables.contains(where: { b.type(of: $0).Is(objType) })
+        if probability(0.5) && haveVisibleObjects {
+            parameters = .parameters(.plain(objType), .plain(objType), .jsAnything, .jsAnything)
+        }
+
+        let f = b.buildPlainFunction(with: parameters) { params in
+            b.buildRecursive(n: Int.random(in: 3...10))
+            b.doReturn(b.randomJsVariable())
+        }
+
+        for _ in 0..<3 {
+            let (arguments, matches) = b.randomArguments(forCallingGuardableFunction: f)
+            b.callFunction(f, withArgs: arguments, guard: !matches)
+        }
+    }
+    let functionCallGenerator = CodeGenerator("FunctionCall", inputs: .required(.function())) {
+        b, f in
+        assert(b.type(of: f).Is(.function()))
+        let (arguments, matches) = b.randomArguments(forCallingGuardableFunction: f)
+        let rval = b.callFunction(f, withArgs: arguments, guard: !matches)
+    }
+    let constructorCallGenerator = CodeGenerator(
+        "ConstructorCall", inputs: .required(.constructor())
+    ) { b, c in
+        assert(b.type(of: c).Is(.constructor()))
+        let (arguments, matches) = b.randomArguments(forCallingGuardableFunction: c)
+        let rval = b.construct(c, withArgs: arguments, guard: !matches)
+    }
+    let functionJitCallGenerator = CodeGenerator("FunctionJitCall", inputs: .required(.function()))
+    { b, f in
+        assert(b.type(of: f).Is(.function()))
+        let args = b.randomArguments(forCalling: f)
+        b.buildRepeatLoop(n: 100) { _ in
+            let (arguments, matches) = b.randomArguments(forCallingGuardableFunction: f)
+            b.callFunction(f, withArgs: arguments, guard: !matches)
+        }
+    }
+
+    let prevCodeGenerators = b.fuzzer.codeGenerators
+    b.fuzzer.setCodeGenerators(
+        WeightedList<CodeGenerator>([
+            (primitiveCodeGenerator, 2),
+            (createObjectGenerator, 1),
+            (objectMakerGenerator, 1),
+            (objectConstructorGenerator, 1),
+            (objectClassGenerator, 1),
+
+            (propertyStoreGenerator, 10),
+            (propertyLoadGenerator, 10),
+            (propertyConfigureGenerator, 5),
+            (functionDefinitionGenerator, 2),
+            (functionCallGenerator, 3),
+            (constructorCallGenerator, 2),
+            (functionJitCallGenerator, 2),
+        ]))
+
+    // ... run some of the CodeGenerators to create some initial objects ...
+    b.buildPrefix()
+    // ... and generate a bunch of code.
+    b.build(n: 100, by: .generating)
+
+    // Now, restore the previous code generators and generate some more code.
+    b.fuzzer.setCodeGenerators(prevCodeGenerators)
+    b.build(n: 10)
+
+    // Finally, run HeapObjectVerify on all our generated objects (that are still in scope).
+    for obj in b.visibleVariables where b.type(of: obj).Is(objType) {
+        b.eval("%HeapObjectVerify(%@)", with: [obj])
+    }
+}
+
+public let ValueSerializerFuzzer = ProgramTemplate("ValueSerializerFuzzer") { b in
+    b.buildPrefix()
+
+    // Create some random values that can be serialized below.
+    b.build(n: 50)
+
+    // Load necessary builtins
+    let d8 = b.createNamedVariable(forBuiltin: "d8")
+    let serializer = b.getProperty("serializer", of: d8)
+    let Uint8Array = b.createNamedVariable(forBuiltin: "Uint8Array")
+
+    // Serialize a random object
+    let content = b.callMethod("serialize", on: serializer, withArgs: [b.randomJsVariable()])
+    let u8 = b.construct(Uint8Array, withArgs: [content])
+
+    // Choose a random byte to change
+    let index = Int64.random(in: 0..<100)
+
+    // Either flip or replace the byte
+    let newByte: Variable
+    if probability(0.5) {
+        let bit = b.loadInt(1 << Int.random(in: 0..<8))
+        let oldByte = b.getElement(index, of: u8)
+        newByte = b.binary(oldByte, bit, with: .Xor)
+    } else {
+        newByte = b.loadInt(Int64.random(in: 0..<256))
+    }
+    b.setElement(index, of: u8, to: newByte)
+
+    // Deserialize the resulting buffer
+    let _ = b.callMethod("deserialize", on: serializer, withArgs: [content])
+
+    // Generate some more random code to (hopefully) use the deserialized objects in some interesting way.
+    b.build(n: 10)
+}
+
+// This template fuzzes the RegExp engine.
+// It finds bugs like: crbug.com/1437346 and crbug.com/1439691.
+public let V8RegExpFuzzer = ProgramTemplate("RegExpFuzzer") { b in
+    // Taken from: https://source.chromium.org/chromium/chromium/src/+/refs/heads/main:v8/test/fuzzer/regexp-builtins.cc;l=212;drc=a61b95c63b0b75c1cfe872d9c8cdf927c226046e
+    let twoByteSubjectString = "f\\uD83D\\uDCA9ba\\u2603"
+
+    let replacementCandidates = [
+        "'X'",
+        "'$1$2$3'",
+        "'$$$&$`$\\'$1'",
+        "() => 'X'",
+        "(arg0, arg1, arg2, arg3, arg4) => arg0 + arg1 + arg2 + arg3 + arg4",
+        "() => 42",
+    ]
+
+    let lastIndices = [
+        "undefined", "-1", "0",
+        "1", "2", "3",
+        "4", "5", "6",
+        "7", "8", "9",
+        "50", "4294967296", "2147483647",
+        "2147483648", "NaN", "Not a Number",
+    ]
+
+    let f = b.buildPlainFunction(with: .parameters(n: 0)) { _ in
+        let (pattern, flags) = b.randomRegExpPatternAndFlags()
+        let regExpVar = b.loadRegExp(pattern, flags)
+
+        let lastIndex = chooseUniform(from: lastIndices)
+        let lastIndexString = b.loadString(lastIndex)
+
+        b.setProperty("lastIndex", of: regExpVar, to: lastIndexString)
+
+        let subjectVar: Variable
+
+        if probability(0.1) {
+            subjectVar = b.loadString(twoByteSubjectString)
+        } else {
+            subjectVar = b.loadString(b.randomString())
+        }
+
+        let resultVar = b.loadNull()
+
+        b.buildTryCatchFinally(
+            tryBody: {
+                let symbol = b.createNamedVariable(forBuiltin: "Symbol")
+                withEqualProbability(
+                    {
+                        let res = b.callMethod("exec", on: regExpVar, withArgs: [subjectVar])
+                        b.reassign(variable: resultVar, value: res)
+                    },
+                    {
+                        let prop = b.getProperty("match", of: symbol)
+                        let res = b.callComputedMethod(prop, on: regExpVar, withArgs: [subjectVar])
+                        b.reassign(variable: resultVar, value: res)
+                    },
+                    {
+                        let prop = b.getProperty("replace", of: symbol)
+                        let replacement = withEqualProbability(
+                            {
+                                b.loadString(b.randomString())
+                            },
+                            {
+                                b.loadString(chooseUniform(from: replacementCandidates))
+                            })
+                        let res = b.callComputedMethod(
+                            prop, on: regExpVar, withArgs: [subjectVar, replacement])
+                        b.reassign(variable: resultVar, value: res)
+                    },
+                    {
+                        let prop = b.getProperty("search", of: symbol)
+                        let res = b.callComputedMethod(prop, on: regExpVar, withArgs: [subjectVar])
+                        b.reassign(variable: resultVar, value: res)
+                    },
+                    {
+                        let prop = b.getProperty("split", of: symbol)
+                        let randomSplitLimit = withEqualProbability(
+                            {
+                                "undefined"
+                            },
+                            {
+                                "'not a number'"
+                            },
+                            {
+                                String(b.randomInt())
+                            })
+                        let limit = b.loadString(randomSplitLimit)
+                        let res = b.callComputedMethod(
+                            symbol, on: regExpVar, withArgs: [subjectVar, limit])
+                        b.reassign(variable: resultVar, value: res)
+                    },
+                    {
+                        let res = b.callMethod("test", on: regExpVar, withArgs: [subjectVar])
+                        b.reassign(variable: resultVar, value: res)
+                    })
+            },
+            catchBody: { _ in
+            })
+
+        b.build(n: 7)
+
+        b.doReturn(resultVar)
+    }
+
+    b.eval("%SetForceSlowPath(false)")
+    // compile the regexp once
+    b.callFunction(f)
+    let resFast = b.callFunction(f)
+    b.eval("%SetForceSlowPath(true)")
+    let resSlow = b.callFunction(f)
+    b.eval("%SetForceSlowPath(false)")
+
+    b.build(n: 15)
+}
+
+public let HomomorphicFeedbackFuzzer = ProgramTemplate("HomomorphicFeedbackFuzzer") { b in
+    b.buildPrefix()
+    b.build(n: 10)
+
+    let numObjects = Int.random(in: 5...8)
+    let commonProp = b.randomCustomPropertyName()
+
+    // Add a different property to each object.
+    var objects = (0..<numObjects).map { _ in
+        b.createObject(with: [b.randomCustomPropertyName(): b.randomJsVariable()])
+    }
+
+    // Add the common property.
+    for obj in objects {
+        let value = b.randomJsVariable()
+        b.setProperty(commonProp, of: obj, to: value)
+    }
+
+    // Again, add a different property to each object after the common one.
+    for obj in objects {
+        let finalProp = b.randomCustomPropertyName()
+        let value = b.randomJsVariable()
+        b.setProperty(finalProp, of: obj, to: value)
+    }
+
+    let f = b.buildPlainFunction(with: .parameters(.object())) { args in
+        let o = args[0]
+
+        // Eagerly load the target property (sometimes)
+        if probability(0.7) {
+            b.getProperty(commonProp, of: o)
+        }
+        b.build(n: 20)
+        b.doReturn(b.randomJsVariable())
+    }
+
+    b.eval("%PrepareFunctionForOptimization(%@)", with: [f])
+
+    // Call the target function with 5 of the objects (but not all)
+    let warmupObjects = Array(objects.prefix(5))
+    let warmupArray = b.createArray(with: warmupObjects)
+
+    b.buildForInOfLoop(warmupArray, type: .forOf, isAsync: false, header: .simple) { vars, _ in
+        let obj = vars[0]
+        b.callFunction(f, withArgs: [obj])
+    }
+
+    b.eval("%OptimizeFunctionOnNextCall(%@)", with: [f])
+
+    // Call the target function with all the objects
+    let allObjectsArray = b.createArray(with: objects)
+    b.buildForInOfLoop(allObjectsArray, type: .forOf, isAsync: false, header: .simple) { vars, _ in
+        let obj = vars[0]
+        b.callFunction(f, withArgs: [obj])
+    }
+}
+
+// Creates a trigger function for lazy-deopting an optimized function,
+// hoping that the trigger function will be used inside the optimized function
+// in an interersting way (e.g., passing it as a callback).
+public let IndirectLazyDeoptFuzzer = ProgramTemplate("IndirectLazyDeoptFuzzer") { b in
+    b.buildPrefix()
+    b.build(n: 30)
+
+    let mainFunctionParams = b.randomParameters()
+    let dummyFct = b.buildPlainFunction(with: mainFunctionParams) { args in
+        b.loadString("Dummy function to be reassigned later")
+    }
+
+    let triggerFunctionParams = b.randomParameters()
+    let triggerLazyDeopt = b.buildPlainFunction(with: triggerFunctionParams) { args in
+        b.build(n: 10)
+        b.eval("%DeoptimizeFunction(%@)", with: [dummyFct])
+    }
+    let realFct = b.buildPlainFunction(with: mainFunctionParams) { args in
+        // Hopefully this code will use `triggerLazyDeopt` somehow:
+        b.build(n: 30)
+        b.doReturn(b.randomJsVariable())
+    }
+
+    // Reassign so that `triggerLazyDeopt` will lazy deopt `realFct`
+    b.reassign(variable: dummyFct, value: realFct)
+    let args = b.randomArguments(forCalling: realFct)
+    let guardCalls = probability(0.5)
+    b.eval("%PrepareFunctionForOptimization(%@)", with: [realFct])
+    b.callFunction(realFct, withArgs: args, guard: guardCalls)
+    b.eval("%OptimizeFunctionOnNextCall(%@)", with: [realFct])
+    b.callFunction(realFct, withArgs: args, guard: guardCalls)
+}
+
+// Emits calls with recursive calls of limited depth.
+public let RecursiveLazyDeoptFuzzer = ProgramTemplate("RecursiveLazyDeoptFuzzer") { b in
+    b.buildPrefix()
+    b.build(n: 30)
+
+    let counter = b.loadInt(0)
+    let max = b.loadInt(Int64.random(in: 2...5))
+    let params = b.randomParameters()
+    let dummyFct = b.buildPlainFunction(with: params) { args in
+        b.loadString("Dummy function for emitting recursive call")
+    }
+    let realFct = b.buildPlainFunction(with: params) { args in
+        b.build(n: 10)
+
+        b.buildIf(b.compare(counter, with: max, using: .lessThan)) {
+            b.reassign(variable: counter, value: b.binary(counter, b.loadInt(1), with: .Add))
+            b.callFunction(dummyFct, withArgs: b.randomArguments(forCalling: dummyFct))
+        }
+        // Mark the function for deoptimization. Due to the recursive pattern above, on the outer
+        // stack frames this should trigger a lazy deoptimization.
+        b.eval("%DeoptimizeNow();")
+        b.build(n: 30)
+        b.doReturn(b.randomJsVariable())
+    }
+
+    // Turn the call into a recursive call.
+    b.reassign(variable: dummyFct, value: realFct)
+    let args = b.randomArguments(forCalling: realFct)
+    let guardCalls = probability(0.5)
+    b.eval("%PrepareFunctionForOptimization(%@)", with: [realFct])
+    b.callFunction(realFct, withArgs: args, guard: guardCalls)
+    b.eval("%OptimizeFunctionOnNextCall(%@)", with: [realFct])
+    // Call the function.
+    b.callFunction(realFct, withArgs: args, guard: guardCalls)
+}
+
+public let WasmDeoptFuzzer = WasmProgramTemplate("WasmDeoptFuzzer") { b in
+    b.buildPrefix()
+    b.build(n: 10)
+
+    let calleeSignature = b.randomWasmSignature()
+    // The main function takes the table slot index as an argument to call to a different callee one
+    // after the other.
+    let mainSignatureBase = b.randomWasmSignature()
+    let useTable64 = Bool.random()
+    let mainSignature =
+        [useTable64 ? .wasmi64 : .wasmi32] + mainSignatureBase.parameterTypes
+        => mainSignatureBase.outputTypes
+    let numCallees = Int.random(in: 2...5)
+
+    // Emit a TypeGroup to increase the chance for interesting wasm-gc cases.
+    b.wasmDefineTypeGroup {
+        b.build(n: 10)
+    }
+
+    let wasmModule = b.buildWasmModule(possiblyWithStartFunction: true) { wasmModule in
+        b.build(n: 10)
+        // Emit the callees for the call_indirect
+        let callees = (0..<numCallees).map { _ in
+            wasmModule.addWasmFunction(with: calleeSignature) { function, label, args in
+                b.build(n: 10)
+                return calleeSignature.outputTypes.map(function.findOrGenerateWasmVar)
+            }
+        }
+
+        let calleeSignatureDef = b.wasmDefineAdHocSignatureType(signature: calleeSignature)
+        let table = wasmModule.addTable(
+            elementType: .wasmFuncRef(),
+            minSize: numCallees,
+            definedSignatures: callees.flatMap { [$0, calleeSignatureDef] },
+            isTable64: useTable64)
+
+        wasmModule.addWasmFunction(with: mainSignature) { function, label, args in
+            b.build(n: 10)
+            let callArgs = calleeSignature.parameterTypes.map(function.findOrGenerateWasmVar)
+            function.wasmCallIndirect(
+                signatureDef: calleeSignatureDef, table: table, functionArgs: callArgs,
+                tableIndex: args[0])
+            b.build(n: 10)
+            return mainSignature.outputTypes.map(function.findOrGenerateWasmVar)
+        }
+    }
+
+    let exports = wasmModule.loadExports()
+    let mainFctName = wasmModule.getExportedMethods().last!.0
+    let mainFct = b.getProperty(mainFctName, of: exports)
+    let mainSignatureJS = ProgramBuilder.convertWasmSignatureToJsSignature(mainSignature)
+    for index in (0..<numCallees).shuffled() {
+        var args = b.findOrGenerateArguments(forSignature: mainSignatureJS)
+        args[0] = useTable64 ? b.loadBigInt(Int64(index)) : b.loadInt(Int64(index))
+        b.callFunction(mainFct, withArgs: args)
+        b.eval("%WasmTierUpFunction(%@)", with: [mainFct])
+        b.callFunction(mainFct, withArgs: args)
+    }
+}
+
+public let WasmInJsInliningFuzzer = WasmProgramTemplate("WasmInJsInliningFuzzer") { b in
+    b.buildPrefix()
+    b.build(n: 10)
+
+    // TODO(mliedtke): Be a bit more flexible while still preferring inlineable signatures?
+    let allowedTypes: [ILType] = [.wasmi32, .wasmi64, .wasmf32, .wasmf64, .wasmExternRef()]
+    let wasmSignature =
+        (0..<Int.random(in: 0...3)).map { _ in allowedTypes.randomElement()! }
+        => (0..<Int.random(in: 0...1)).map { _ in allowedTypes.randomElement()! }
+
+    // Emit a TypeGroup to increase the chance for interesting wasm-gc cases.
+    b.wasmDefineTypeGroup {
+        b.build(n: 3)
+    }
+
+    // Create a Wasm function that we can call from JS.
+    let wasmModule = b.buildWasmModule(possiblyWithStartFunction: true) { wasmModule in
+        // Build some other functions, tags, globals, tables etc.
+        b.build(n: 5)
+        // Create the function we want to call from JS.
+        wasmModule.addWasmFunction(with: wasmSignature) { function, label, args in
+            // Use a small budget. This increases the chance of hitting cases that will try the body
+            // inlining.
+            b.build(n: Int.random(in: 1...10))
+            return wasmSignature.outputTypes.map(function.findOrGenerateWasmVar)
+        }
+    }
+
+    let exports = wasmModule.loadExports()
+    let wasmFctName = wasmModule.getExportedMethods().last!.0
+    let wasmFct = b.getProperty(wasmFctName, of: exports)
+
+    // Add an object to the scope that if used as a numeric argument, triggers a lazy deopt of the
+    // JS function inlining the Wasm function.
+    let lazyDeoptTrigger = b.buildObjectLiteral { _ in }
+
+    // Potentially adding some control-flow or trying to inline into try-catch blocks which require
+    // wiring up of exception-continuations or other special cases.
+    let possibleWrappers: [(@escaping () -> Void) -> Void] = [
+        { f in f() },
+        { f in
+            b.buildIfElse(b.randomJsVariable()) {
+                f()
+            } elseBody: {
+                b.build(n: 5)
+            }
+        },
+        { f in b.buildRepeatLoop(n: 5, { f() }) },
+        { f in
+            b.buildTryCatchFinally {
+                f()
+            } catchBody: { _ in
+                b.build(n: 5)
+            }
+        },
+        { f in
+            b.buildTryCatchFinally {
+                b.throwException(b.randomJsVariable())
+            } catchBody: { _ in
+                f()
+            }
+        },
+    ]
+
+    // Create a JS function that calls the Wasm function.
+    let params = ProgramBuilder.SubroutineDescriptor.parameters(n: 1)
+    let body = { (args: [Variable]) in
+        b.build(n: 5)
+        let jsSig = ProgramBuilder.convertWasmSignatureToJsSignature(wasmSignature)
+        possibleWrappers.randomElement()! {
+            b.build(n: 5)
+            let args = b.randomArguments(forCallingFunctionWithSignature: jsSig)
+            b.callFunction(wasmFct, withArgs: args)
+            b.build(n: 5)
+        }
+        b.build(n: 5)
+        b.doReturn(b.randomJsVariable())
+    }
+    // Pick an arbitrary function "type".
+    let jsFct = withEqualProbability(
+        { b.buildPlainFunction(with: params, body) },
+        { b.buildArrowFunction(with: params, body) },
+        { b.buildGeneratorFunction(with: params, body) },
+        { b.buildAsyncFunction(with: params, body) },
+    )
+
+    // Finish the deopt trigger now that the jsFct is in scope.
+    b.setProperty(
+        "valueOf", of: lazyDeoptTrigger,
+        to: b.buildArrowFunction(with: .parameters(n: 0)) { _ in
+            b.eval("%DeoptimizeFunction(%@);", with: [jsFct])
+        })
+
+    // Collect feedback and tier-up the JS function, potentially triggering some wasm-into-js
+    // inlining. Use two different arguments to increase the chance for differneces in behavior
+    // between the feedback collection and the optimized run.
+    b.eval("%PrepareFunctionForOptimization(%@)", with: [jsFct])
+    b.callFunction(jsFct, withArgs: [b.randomJsVariable()], guard: true)
+    b.eval("%OptimizeFunctionOnNextCall(%@)", with: [jsFct])
+    b.callFunction(jsFct, withArgs: [b.randomJsVariable()], guard: true)
+}
+
+public let WasmTurbofanFuzzer = WasmProgramTemplate("WasmTurbofanFuzzer") { b in
+    b.buildPrefix()
+    b.build(n: 10)
+
+    let wasmSignature = b.randomWasmSignature()
+
+    // Emit a TypeGroup to increase the chance for interesting wasm-gc cases.
+    b.wasmDefineTypeGroup {
+        b.build(n: 10)
+    }
+
+    let wasmModule = b.buildWasmModule(possiblyWithStartFunction: true) { wasmModule in
+        // Have some budget for tables, globals, memories, other functions that can be called, ...
+        b.build(n: 30)
+
+        // Add the function that we are going to call and optimize from JS.
+        wasmModule.addWasmFunction(with: wasmSignature) { function, label, args in
+            b.build(n: 20)
+            return wasmSignature.outputTypes.map(function.findOrGenerateWasmVar)
+        }
+    }
+
+    let exports = wasmModule.loadExports()
+    let wasmFctName = wasmModule.getExportedMethods().last!.0
+    let wasmFct = b.getProperty(wasmFctName, of: exports)
+    let jsSignature = ProgramBuilder.convertWasmSignatureToJsSignature(wasmSignature)
+    var args = b.findOrGenerateArguments(forSignature: jsSignature)
+    b.callFunction(wasmFct, withArgs: args)
+    // Force tier-up (Turbofan compilation).
+    b.eval("%WasmTierUpFunction(%@)", with: [wasmFct])
+    b.callFunction(wasmFct, withArgs: args)
+}
+
+public let jsD8 = ObjectGroup(
+    name: "D8", instanceType: .jsD8, properties: ["test": .jsD8Test], methods: [:])
+
+public let jsD8Test = ObjectGroup(
+    name: "D8Test", instanceType: .jsD8Test, properties: ["FastCAPI": .jsD8FastCAPIConstructor],
+    methods: [:])
+
+public let jsD8FastCAPI = ObjectGroup(
+    name: "D8FastCAPI", instanceType: .jsD8FastCAPI, properties: [:],
+    methods: [
+        "throw_no_fallback": [] => .integer,
+        "add_32bit_int": [.integer, .integer] => .integer,
+    ])
+
+public let WasmFastCallFuzzer = WasmProgramTemplate("WasmFastCallFuzzer") { b in
+    b.buildPrefix()
+    b.build(n: 10)
+    let target = fastCallables.randomElement()!
+    let apiObj = b.findOrGenerateType(target.group)
+
+    // Bind the API function so that it can be called from WebAssembly.
+    let wrapped = b.bindMethod(target.method, on: apiObj)
+
+    let functionSig = chooseUniform(from: b.methodSignatures(of: target.method, on: target.group))
+    let wrappedSig = [.plain(b.type(of: apiObj))] + functionSig.parameters => functionSig.outputType
+
+    let m = b.buildWasmModule(possiblyWithStartFunction: true) { m in
+        let allWasmTypes: WeightedList<ILType> = WeightedList([
+            (.wasmi32, 1), (.wasmi64, 1), (.wasmf32, 1), (.wasmf64, 1), (.wasmExternRef(), 1),
+            (.wasmFuncRef(), 1),
+        ])
+        let wasmSignature = ProgramBuilder.convertJsSignatureToWasmSignature(
+            wrappedSig, availableTypes: allWasmTypes)
+        m.addWasmFunction(with: wasmSignature) { fbuilder, _, _ in
+            let args = b.randomWasmArguments(forWasmSignature: wasmSignature)
+            if let args {
+                let maybeRet = fbuilder.wasmJsCall(
+                    function: wrapped, withArgs: args, withWasmSignature: wasmSignature)
+                if let ret = maybeRet {
+                    return [ret]
+                }
+            } else {
+                Logger(withLabel: "V8CommonProfile").error("Arguments should have been generated")
+            }
+            return wasmSignature.outputTypes.map(fbuilder.findOrGenerateWasmVar)
+        }
+    }
+
+    let exports = m.loadExports()
+
+    for (methodName, _) in m.getExportedMethods() {
+        let exportedMethod = b.getProperty(methodName, of: exports)
+        b.eval("%WasmTierUpFunction(%@)", with: [exportedMethod])
+        let args = b.findOrGenerateArguments(forSignature: wrappedSig)
+        b.callMethod(methodName, on: exports, withArgs: args)
+    }
+}
+
+public let FastApiCallFuzzer = ProgramTemplate("FastApiCallFuzzer") { b in
+    b.buildPrefix()
+    b.build(n: 20)
+    let parameterCount = probability(0.5) ? 0 : Int.random(in: 1...4)
+
+    let f = b.buildPlainFunction(with: .parameters(n: parameterCount)) { args in
+        b.build(n: 10)
+        let target = fastCallables.randomElement()!
+        let apiObj = b.findOrGenerateType(target.group)
+        let functionSig = chooseUniform(
+            from: b.methodSignatures(of: target.method, on: target.group))
+        let apiCall = b.callMethod(
+            target.method, on: apiObj,
+            withArgs: b.findOrGenerateArguments(forSignature: functionSig), guard: true)
+        b.doReturn(apiCall)
+    }
+
+    let args = b.randomJsVariables(n: Int.random(in: 0...5))
+    let guardCalls = probability(0.5)
+    b.callFunction(f, withArgs: args, guard: guardCalls)
+
+    b.eval("%PrepareFunctionForOptimization(%@)", with: [f])
+
+    b.callFunction(f, withArgs: args, guard: guardCalls)
+    b.callFunction(f, withArgs: args, guard: guardCalls)
+
+    b.eval("%OptimizeFunctionOnNextCall(%@)", with: [f])
+
+    b.callFunction(f, withArgs: args, guard: guardCalls)
+
+    b.build(n: 10)
+}
+
+public let ProtoAssignSeqOptFuzzer = ProgramTemplate("ProtoAssignSeqOptFuzzer") { b in
+    b.buildPrefix()
+
+    let containingFct = b.buildPlainFunction(with: b.randomParameters()) { args in
+        // The function to install the prototypes on.
+        let params = b.randomParameters()
+        let body = { (args: [Variable]) in
+            b.build(n: 20)
+            b.doReturn(b.randomVariable(forUseAs: .object()))
+        }
+        let fct = withEqualProbability(
+            { b.buildPlainFunction(with: params, body) },
+            { b.buildArrowFunction(with: params, body) },
+            { b.buildGeneratorFunction(with: params, body) },  // not a valid constructor
+            { b.buildAsyncFunction(with: params, body) },  // not a valid constructor
+            { b.buildConstructor(with: params, body) },
+            {
+                b.buildClassDefinition(withSuperclass: b.randomVariable(forUseAs: .object())) { _ in
+                    b.build(n: 30)
+                }
+            }
+        )
+        // Explicitly expose the prototype property to make modifications of it more likely.
+        b.getProperty("prototype", of: fct)
+        // Allow further modifications on the function.
+        b.build(n: 10)
+        // Perform the prototype assignments.
+        for _ in 0..<Int.random(in: 2...10) {
+            let val = b.randomVariable(forUseAs: .primitive)
+            let name = b.randomCustomPropertyName()
+            // TODO(mliedtke): This should be a setProperty(getProperty("prototype")) instead of
+            // treating `prototype.name` as a single property.
+            b.setProperty("prototype.\(name)", of: fct, to: val)
+        }
+        // Allow further modifications after the optimized sequence.
+        b.build(n: 10)
+        // Construct the object with the `new` keyword. Add a guard because not all chosen functions
+        // are valid constructors.
+        b.construct(fct, withArgs: b.randomArguments(forCalling: fct), guard: true)
+        // Generate arbitrary code that could also use the constructed object.
+        b.build(n: 30)
+        b.doReturn(b.randomJsVariable())
+    }
+    let sig = b.type(of: containingFct).signature ?? Signature.forUnknownFunction
+    b.callFunction(containingFct, withArgs: b.randomArguments(forCalling: containingFct))
+    b.build(n: 10)
+}
+
+public let TurbofanTierUpNonInlinedCallFuzzer =
+    ProgramTemplate("TurbofanTierUpNonInlinedCallFuzzer") { b in
+        b.buildPrefix()
+        b.build(n: 50)
+        // Find a function (or generate a new one) to be marked as "never optimize".
+        let unoptimizedFunction =
+            b.randomVariable(ofType: .function())
+            ?? b.buildPlainFunction(with: .parameters(n: 2)) { _ in
+                b.build(n: 20)
+                b.doReturn(b.randomJsVariable())
+            }
+        b.eval("%NeverOptimizeFunction(%@)", with: [unoptimizedFunction])
+        // Create another function that calls the unoptimized function. This will always create a real
+        // call instead of inlining it.
+        let optimizedFunction = b.buildPlainFunction(with: .parameters(n: 0)) { _ in
+            // This should be able to generate interesting things including calls to the unoptimized
+            // function in all kinds of control flow.
+            b.build(n: 30)
+            // Also explicitly emit a call to the unoptimized function.
+            b.callFunction(
+                unoptimizedFunction, withArgs: b.randomArguments(forCalling: unoptimizedFunction))
+            b.build(n: 10)
+        }
+        // Collect feedback and optimize the function.
+        // Guard all calls. The path where they throw is still interesting as there are
+        // optimizations that affect the unwinding logic which we'd like to get coverage for as well.
+        b.eval("%PrepareFunctionForOptimization(%@)", with: [optimizedFunction])
+        b.callFunction(optimizedFunction, guard: true)
+        b.callFunction(optimizedFunction, guard: true)
+        b.eval("%OptimizeFunctionOnNextCall(%@)", with: [optimizedFunction])
+        b.callFunction(optimizedFunction, guard: true)
+    }
+
+// Configure V8 invocation arguments. `forSandbox` is used by the V8SandboxProfile. As the sandbox
+// fuzzer does not crash on regular assertions, most validation flags do not make sense in that
+// configuraiton.
+public func v8ProcessArgs(randomize: Bool, forSandbox: Bool) -> [String] {
+    var args = [
+        "--expose-gc",
+        "--expose-externalize-string",
+        "--omit-quit",
+        "--allow-natives-syntax",
+        "--fuzzing",
+        "--harmony",
+        "--experimental-fuzzing",
+        "--js-staging",
+        "--wasm-staging",
+        "--wasm-fast-api",
+        "--expose-fast-api",
+        "--wasm-test-streaming",  // WebAssembly.compileStreaming & WebAssembly.instantiateStreaming()
+        // NOTE: --wasm-assume-ref-cast-desc-succeeds removed. Under
+        // --wasm-staging (d8 15.3) it is no longer a registered flag, so d8
+        // prints "Warning: unknown flag ..." to stdout on EVERY execution,
+        // which triggers Fuzzilli's "Runner has non-empty output for empty
+        // program!" warning and pollutes every captured stdout.
+    ]
+    if forSandbox {
+        args.append("--sandbox-fuzzing")
+        // This is so that we get an ASan splat directly in the reproducer file.
+        args.append("--disable-in-process-stack-traces")
+    }
+
+    guard randomize else { return args }
+
+    // Prioritize fuzzing "future" logic as it is more likely to have bugs but keep some basic
+    // coverage for the shipping non-future logic.
+    if probability(0.8) {
+        args.append("--future")
+    }
+
+    //
+    // Existing features that should sometimes be disabled.
+    //
+    if probability(0.1) {
+        args.append("--no-turbofan")
+        if probability(0.5) {
+            args.append("--maglev-as-top-tier")
+        }
+    } else if probability(0.1) {
+        args.append(
+            probability(0.5)
+                ? "--turbo-instruction-scheduling"
+                : "--turbo-stress-instruction-scheduling")
+    }
+
+    if probability(0.1) {
+        args.append("--no-flush-bytecode")
+    }
+
+    if probability(0.1) {
+        args.append("--no-maglev")
+    }
+
+    if probability(0.1) {
+        args.append("--no-sparkplug")
+    }
+
+    if probability(0.1) {
+        args.append("--no-short-builtin-calls")
+    }
+
+    if probability(0.8) {
+        args.append("--jit-fuzzing")
+    }
+
+    // Disabling Liftoff enables "direct" coverage for the optimizing compiler, though some
+    // features (like speculative inlining) require a combination of Liftoff and Turbofan.
+    // Note that this flag only affects WebAssembly.
+    if probability(0.5) {
+        args.append("--no-liftoff")
+        if probability(0.3) && !forSandbox {
+            args.append("--wasm-assert-types")
+        }
+    } else if probability(0.2) {
+        args.append("--wasm-sync-tier-up")
+    }
+
+    // This greatly helps the fuzzer to decide inlining wasm functions into each other when
+    // %WasmTierUpFunction() is used as in most cases the call counts will be way too low to
+    // align with V8's current inlining heuristics (which uses absolute call counts as a
+    // deciding factor).
+    if probability(0.5) {
+        args.append("--wasm-inlining-ignore-call-counts")
+    }
+
+    // Force compiled Wasm wrappers.
+    if probability(0.3) {
+        args.append("--no-wasm-generic-wrapper")
+    }
+
+    if probability(0.2) {
+        args.append("--no-wasm-native-module-cache")
+    }
+
+    if probability(0.2) {
+        args.append("--wasm-caching-threshold=\(Int.random(in: 1...1000))")
+    }
+
+    if probability(0.2) {
+        args.append("--wasm-random-rescheduling")
+    }
+
+    // Disabling batching allows the fuzzer to reach higher JIT tiers faster; sometimes test the
+    // production configuration too.
+    if probability(0.8) {
+        args.append("--no-baseline-batch-compilation")
+    }
+
+    // Disabling lazy feedback allocation allows the fuzzer to reach higher JIT tiers faster;
+    // sometimes test with the production configuration too.
+    if probability(0.8) {
+        args.append("--no-lazy-feedback-allocation")
+    }
+
+    //
+    // Future features that should sometimes be enabled.
+    //
+    if probability(0.1) {
+        args.append("--minor-ms")
+    }
+
+    // Enable the shared heap.
+    if probability(0.25) {
+        // Either use the shared-string-table (needed for JS shared structs) or only allow
+        // shared strings (needed for shared Wasm objects).
+        args.append(Bool.random() ? "--shared-string-table" : "--shared-strings")
+    }
+
+    if !args.contains("--no-maglev") {
+        if probability(0.5) {
+            args.append("--maglev-untagged-phis")
+        }
+        if probability(0.1) {
+            args.append("--no-maglev-loop-peeling")
+        }
+        if probability(0.25) {
+            args.append("--maglev-future")
+        }
+        if probability(0.1) {
+            args.append("--maglev-assert")
+        }
+        if probability(0.05) {
+            args.append("--maglev-assert-stack-size")
+        }
+        if probability(0.2) {
+            args.append("--maglev-non-eager-inlining")
+            if probability(0.4) {  // TODO: @tacet decrease this probability to max 0.2
+                args.append("--max-maglev-inlined-bytecode-size-small=0")
+            }
+        }
+    }
+
+    if probability(0.7) {
+        args.append("--turbolev")
+        if probability(0.82) {
+            args.append("--turbolev-future")
+            if probability(0.3) {  // TODO: @tacet change to 0.15
+                args.append("--max-inlined-bytecode-size-small=0")
+            }
+        }
+        if probability(0.1) {
+            args.append("--maglev-disable-builtin-reducers")
+        }
+    }
+
+    if probability(0.1) {
+        args.append("--harmony-struct")
+    }
+
+    if probability(0.1) {
+        args.append("--efficiency-mode")
+    }
+
+    if probability(0.1) {
+        args.append("--battery-saver-mode")
+    }
+
+    if probability(0.1) {
+        args.append("--stress-scavenger-conservative-object-pinning-random")
+    }
+
+    if probability(0.1) {
+        args.append("--precise-object-pinning")
+    }
+
+    if probability(0.1) {
+        args.append("--scavenger-chaos-mode")
+        let threshold = Int.random(in: 0...100)
+        args.append("--scavenger-chaos-mode-threshold=\(threshold)")
+    }
+
+    if probability(0.1) {
+        args.append("--stress-descriptor-array-trimming")
+    }
+
+    if probability(0.1) {
+        let stackSize = Int.random(in: 54...863)
+        args.append("--stack-size=\(stackSize)")
+    }
+
+    // Temporarily enable the three flags below with high probability to
+    // stress-test JSPI.
+    // Lower the probabilities once we have enough coverage.
+    if probability(0.5) {
+        let stackSwitchingSize = Int.random(in: 1...300)
+        args.append("--wasm-stack-switching-stack-size=\(stackSwitchingSize)")
+    }
+    if probability(0.5) {
+        args.append("--wasm-growable-stacks")
+    }
+    if probability(0.5) {
+        args.append("--stress-wasm-stack-switching")
+    }
+
+    if probability(0.5) {
+        args.append("--proto-assign-seq-lazy-func-opt")
+        if probability(0.5) {
+            args.append("--proto-assign-seq-opt-count=1")
+        }
+    }
+
+    if probability(0.5) {
+        args.append("--private-field-bytecodes")
+    }
+
+    // Choose the bytecode verification level: default (currently none), light or full.
+    if probability(0.67) {
+        args.append(probability(0.5) ? "--verify-bytecode-light" : "--verify-bytecode-full")
+    }
+
+    //
+    // Sometimes enable additional verification/stressing logic (which may be fairly expensive).
+    //
+    if !forSandbox {
+        if probability(0.1) {
+            args.append("--verify-heap")
+        }
+        if probability(0.1) {
+            args.append("--turbo-verify")
+        }
+        if probability(0.1) {
+            args.append("--turbo-verify-allocation")
+        }
+        if probability(0.1) {
+            args.append("--assert-types")
+        }
+        if (!args.contains("--no-maglev") || args.contains("--turbolev")) && probability(0.1) {
+            // TODO(tacet): update the Turbolev conditions to !args.contains("--no-turbolev") after Turbolev trial
+            args.append("--maglev-assert-types")
+        }
+        if probability(0.2) {
+            args.append("--turboshaft-verify-load-elimination")
+        }
+        if probability(0.1) {
+            args.append("--turboshaft-verify-reductions")
+        }
+        if probability(0.2) {
+            args.append("--turboshaft-verify-load-store-taggedness")
+        }
+        // This stressing is only reasonable for non-sandbox fuzzing, since it might trigger benign
+        // CHECKs that could mask actual sandbox violations. The stressing also happens to break
+        // some reproducers because of slightly changing memory layouts, hence this "medium"
+        // probability.
+        if probability(0.5) {
+            args.append("--stress-lazy-source-positions")
+        }
+        // This stressing is usually useful, but also run with the production configuration
+        // sometimes too. Similarly to the above, in sandbox fuzzers it'd trigger benign CHECKs
+        // hence avoided.
+        if probability(0.9) {
+            args.append("--stress-lazy")
+        }
+    }
+
+    if probability(0.1) {
+        args.append(
+            "--deopt-every-n-times=\(chooseUniform(from: [100, 250, 500, 1000, 2500, 5000, 10000]))"
+        )
+    }
+    if probability(0.1) {
+        args.append("--stress-ic")
+    }
+    if probability(0.1) {
+        args.append("--optimize-on-next-call-optimizes-to-maglev")
+    }
+
+    //
+    // A gc-stress session with some fairly expensive flags.
+    //
+    if probability(0.1) {
+        if probability(0.4) {
+            args.append("--stress-marking=\(Int.random(in: 1...100))")
+        }
+        if probability(0.4) {
+            args.append("--stress-scavenge=\(Int.random(in: 1...100))")
+        }
+        if probability(0.5) {
+            args.append("--stress-flush-code")
+        }
+        if probability(0.5) {
+            args.append("--wasm-code-gc")
+            args.append("--stress-wasm-code-gc")
+        }
+        if probability(0.5) {
+            args.append("--stress-wasm-memory-moving")
+        }
+        if probability(0.4) {
+            args.append(
+                chooseUniform(
+                    from: [
+                        "--gc-interval=\(Int.random(in: 100...10000))",
+                        "--random-gc-interval=\(Int.random(in: 1000...10000))",
+                    ]))
+        }
+        if probability(0.4) {
+            args.append("--concurrent-recompilation-queue-length=\(Int.random(in: 4...64))")
+            args.append("--concurrent-recompilation-delay=\(Int.random(in: 1...500))")
+        }
+        if probability(0.6) {
+            args.append(
+                chooseUniform(
+                    from: ["--stress-compaction", "--stress-compaction-random"]))
+        }
+    }
+
+    //
+    // More exotic configuration changes.
+    //
+    if probability(0.05) {
+        func chooseBooleanFlag(_ flag: String) {
+            assert(!flag.starts(with: "--"))
+            args.append(probability(0.5) ? "--\(flag)" : "--no-\(flag)")
+        }
+
+        if probability(0.5) { args.append("--stress-gc-during-compilation") }
+        if probability(0.5) { args.append("--lazy-new-space-shrinking") }
+        if probability(0.5) { args.append("--stress-wasm-memory-moving") }
+        if probability(0.5) { args.append("--stress-background-compile") }
+        if probability(0.5) { args.append("--parallel-compile-tasks-for-lazy") }
+        if probability(0.5) { args.append("--parallel-compile-tasks-for-eager-toplevel") }
+
+        chooseBooleanFlag("always-sparkplug")
+        chooseBooleanFlag("always-osr")
+        chooseBooleanFlag("concurrent-osr")
+        chooseBooleanFlag("force-slow-path")
+        chooseBooleanFlag("lazy")
+        chooseBooleanFlag("lazy-eval")
+
+        // Maglev related flags
+        chooseBooleanFlag("maglev-inline-api-calls")
+        chooseBooleanFlag("maglev-inlining")
+        chooseBooleanFlag("maglev-optimistic-peeled-loops")
+        chooseBooleanFlag("maglev-pretenure-store-values")
+        chooseBooleanFlag("maglev-poly-calls")
+        chooseBooleanFlag("maglev-truncation")
+        chooseBooleanFlag("maglev-cse")
+        chooseBooleanFlag("maglev-range-analysis")
+        chooseBooleanFlag("maglev-escape-analysis")
+        chooseBooleanFlag("maglev-licm")
+
+        // Compiler related flags
+        chooseBooleanFlag("turbo-move-optimization")
+        chooseBooleanFlag("turbo-jt")  // jump threading
+        chooseBooleanFlag("turbo-loop-peeling")
+        chooseBooleanFlag("turbo-loop-variable")
+        chooseBooleanFlag("turbo-loop-rotation")
+        chooseBooleanFlag("turbo-cf-optimization")
+        chooseBooleanFlag("turbo-escape")
+        chooseBooleanFlag("turbo-allocation-folding")
+        chooseBooleanFlag("turbo-instruction-scheduling")
+        chooseBooleanFlag("turbo-stress-instruction-scheduling")
+        chooseBooleanFlag("turbo-store-elimination")
+        chooseBooleanFlag("turbo-rewrite-far-jumps")
+        chooseBooleanFlag("turbo-optimize-apply")
+        chooseBooleanFlag("turbo-load-elimination")
+        chooseBooleanFlag("turbo-inlining")
+        chooseBooleanFlag("turbo-splitting")
+        args.append(
+            chooseUniform(from: [
+                "--no-enable-sse3", "--no-enable-ssse3", "--no-enable-sse4-1", "--no-enable-sse4-2",
+                "--no-enable-avx", "--no-enable-avx2",
+            ]))
+
+        chooseBooleanFlag("turboshaft-loop-unrolling")
+        chooseBooleanFlag("turboshaft-load-elimination")
+        chooseBooleanFlag("turboshaft-string-concat-escape-analysis")
+
+        // Wasm related flags
+        chooseBooleanFlag("wasm-loop-peeling")
+        chooseBooleanFlag("turboshaft-wasm-load-elimination")
+        chooseBooleanFlag("wasm-loop-unrolling")
+        chooseBooleanFlag("wasm-inlining")
+        chooseBooleanFlag("wasm-opt")
+        chooseBooleanFlag("wasm-deopt")
+        chooseBooleanFlag("wasm-enforce-bounds-checks")
+        chooseBooleanFlag("wasm-math-intrinsics")
+        chooseBooleanFlag("wasm-bulkmem-inlining")
+        chooseBooleanFlag("wasm-lazy-compilation")
+    }
+
+    return args
+}

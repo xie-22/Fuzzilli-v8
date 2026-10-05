@@ -1,0 +1,106 @@
+// Copyright 2020 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+package fuzzilli.protobuf;
+
+// Messages sent between Fuzzilli instances.
+
+message LogMessage {
+    // UUID of the original instance
+    string origin = 1;
+    uint32 level = 2;
+    string label = 3;
+    string content = 4;
+}
+
+message FuzzerState {
+    bytes corpus = 1;
+    bytes evaluatorState = 2;
+    bool isWasmEnabled = 3;
+    bool areBundlesEnabled = 4;
+}
+
+message Statistics {
+        /// The total number of samples produced.
+        uint64 totalSamples = 1;
+
+        /// The number of valid samples produced.
+        uint64 validSamples = 2;
+
+        /// The number of intersting samples produced.
+        uint64 interestingSamples = 3;
+
+        /// The number of timed-out samples produced.
+        uint64 timedOutSamples = 4;
+
+        /// The number of crashes found.
+        uint64 crashingSamples = 5;
+
+        /// The total number of program executions.
+        uint64 totalExecs = 6;
+
+        /// The average size of the corpus of this node and its child nodes.
+        double avgCorpusSize = 7;
+
+        /// The average size of recently generated programs.
+        double avgProgramSize = 8;
+
+        /// The average size of programs recently added to the corpus.
+        double avgCorpusProgramSize = 9;
+
+        /// The average execution time of recently generated and successfully executed programs in seconds.
+        double avgExecutionTime = 10;
+
+        /// The current number of executions per second.
+        double execsPerSecond = 11;
+
+        /// The average fraction of the total time that is not spent executing programs in the target engine.
+        double fuzzerOverhead = 12;
+
+        /// The average fraction of recent executions spent on minimization.
+        double minimizationOverhead = 13;
+
+        /// The number of child nodes connected directly or indirectly to this instance, i.e. the size of the (sub-)tree rooted at this instance.
+        uint64 numChildNodes = 14;
+
+        /// The percentage of edges covered if doing coverage-guided fuzzing.
+        double coverage = 15;
+
+        /// The correctness rate of recently generated programs (number of valid programs divided by number of generated programs).
+        double correctnessRate = 16;
+
+        /// The timeout rate of recently generated programs (number of timeouts divided by number of generated programs).
+        double timeoutRate = 17;
+
+        /// The number of programs resulting in valid differential produced.
+        uint64 differentialSamples = 18;
+
+        message ContributorStats {
+            string name = 1;
+            uint64 invocationCount = 2;
+            uint64 successfulGenerationCount = 3;
+            uint64 totalSamples = 4;
+            uint64 correctSamples = 5;
+            bool isCodeGenerator = 6;
+            uint64 interestingSamples = 7;
+            uint64 invalidSamples = 8;
+            uint64 timedOutSamples = 9;
+            uint64 crashingSamples = 10;
+            uint64 differentialSamples = 11;
+            uint64 failures = 12;
+            uint64 totalInstructionsProduced = 13;
+        }
+        repeated ContributorStats contributorStats = 19;
+}

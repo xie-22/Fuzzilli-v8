@@ -1,0 +1,2314 @@
+// Copyright 2023 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+import Foundation
+
+/// Compiles a JavaScript AST into a FuzzIL program.
+public class JavaScriptCompiler {
+    public typealias AST = Compiler_Protobuf_AST
+    typealias ClassFieldNode = Compiler_Protobuf_ClassField
+    typealias StatementNode = Compiler_Protobuf_Statement
+    typealias ExpressionNode = Compiler_Protobuf_Expression
+
+    // Simple error enum for errors that are displayed to the user.
+    public enum CompilerError: Error {
+        case invalidASTError(String)
+        case invalidNodeError(String)
+        case unsupportedFeatureError(String)
+    }
+
+    public init() {}
+
+    /// The compiled code.
+    // TODO(marja): Make JavaScriptCompiler understand bundles.
+    private var code = Code(isBundle: false)
+
+    /// The environment is used to determine if an identifier identifies a builtin object.
+    /// TODO we should probably use the correct target environment, with any additional builtins etc. here. But for now, we just manually add `gc` since that's relatively common.
+    private var environment = JavaScriptEnvironment(additionalBuiltins: ["gc": .function()])
+
+    /// Contains the mapping from JavaScript variables to FuzzIL variables in every active scope.
+    private var scopes = Stack<[String: Variable]>()
+
+    /// Contains a tuple for every active scope.
+    private var labelsStack = Stack<(label: String?, variable: Variable?, isLoopLabel: Bool?)>()
+
+    /// The next free FuzzIL variable.
+    private var nextVariable = 0
+
+    /// Context analyzer to track the context of the code being compiled. Used for example to distinguish switch and loop breaks.
+    private var contextAnalyzer = ContextAnalyzer()
+
+    public func compile(_ ast: AST) throws -> Program {
+        reset()
+
+        try enterNewScope {
+            for statement in ast.statements {
+                try compileStatement(statement)
+            }
+        }
+
+        try code.check()
+
+        return Program(code: code)
+    }
+
+    /// Allocates the next free variable.
+    private func nextFreeVariable() -> Variable {
+        let v = Variable(number: nextVariable)
+        nextVariable += 1
+        return v
+    }
+
+    @discardableResult
+    private func compileClass(
+        _ name: String, superClass: ExpressionNode?, fields: [ClassFieldNode], isExpression: Bool
+    ) throws -> Variable {
+        // The expressions for property values, computed properties and method default parameters need to be emitted before the class declaration is opened.
+        var propertyValues = [Variable]()
+        var computedKeys = [Variable]()
+        var defaultValuesPerSubroutine = [[Variable]]()
+        for field in fields {
+            guard let field = field.field else {
+                throw CompilerError.invalidNodeError("missing concrete field in class declaration")
+            }
+
+            let key: Compiler_Protobuf_PropertyKey?
+            switch field {
+            case .property(let property):
+                if property.hasValue {
+                    propertyValues.append(try compileExpression(property.value))
+                }
+                key = property.key
+            case .method(let method):
+                defaultValuesPerSubroutine.append(try compileDefaultValues(for: method.parameters))
+                key = method.key
+            case .getter(let getter):
+                key = getter.key
+            case .setter(let setter):
+                key = setter.key
+            case .ctor(let constructor):
+                defaultValuesPerSubroutine.append(
+                    try compileDefaultValues(for: constructor.parameters))
+                key = nil
+            case .staticInitializer:
+                key = nil
+            }
+
+            if let key, case .expression(let expression) = key.body {
+                computedKeys.append(try compileExpression(expression))
+            }
+        }
+
+        // Reverse the arrays since we'll remove the elements in FIFO order.
+        propertyValues.reverse()
+        computedKeys.reverse()
+        defaultValuesPerSubroutine.reverse()
+
+        let classDecl: Instruction
+        if let superClass = superClass {
+            let superClass = try compileExpression(superClass)
+            classDecl = emit(
+                BeginClassDefinition(hasSuperclass: true, isExpression: isExpression),
+                withInputs: [superClass])
+        } else {
+            classDecl = emit(BeginClassDefinition(hasSuperclass: false, isExpression: isExpression))
+        }
+        if !isExpression {
+            map(name, to: classDecl.output)
+        }
+
+        for field in fields {
+            switch field.field! {
+            case .property(let property):
+                guard let key = property.key.body else {
+                    throw CompilerError.invalidNodeError("Missing key in class property")
+                }
+
+                let op: Operation
+                var inputs = [Variable]()
+                switch key {
+                case .name(let name):
+                    op = ClassAddProperty(
+                        propertyName: name, hasValue: property.hasValue,
+                        isStatic: property.isStatic)
+                case .privateName(let name):
+                    op = ClassAddPrivateProperty(
+                        propertyName: name, hasValue: property.hasValue,
+                        isStatic: property.isStatic)
+                case .index(let index):
+                    op = ClassAddElement(
+                        index: index, hasValue: property.hasValue, isStatic: property.isStatic)
+                case .expression:
+                    inputs.append(computedKeys.removeLast())
+                    op = ClassAddComputedProperty(
+                        hasValue: property.hasValue, isStatic: property.isStatic)
+                }
+                if property.hasValue {
+                    inputs.append(propertyValues.removeLast())
+                }
+                emit(op, withInputs: inputs)
+
+            case .ctor(let constructor):
+                let defaultValues = defaultValuesPerSubroutine.removeLast()
+                let parameters = try convertParameters(constructor.parameters)
+                let head = emit(
+                    BeginClassConstructor(parameters: parameters), withInputs: defaultValues)
+
+                try enterNewScope {
+                    var parameters = head.innerOutputs
+                    map("this", to: parameters.removeFirst())
+                    try mapParameters(constructor.parameters, to: parameters)
+                    for statement in constructor.body {
+                        try compileStatement(statement)
+                    }
+                }
+
+                emit(EndClassConstructor())
+
+            case .method(let method):
+                let defaultValues = defaultValuesPerSubroutine.removeLast()
+                let parameters = try convertParameters(method.parameters)
+                let isGenerator = method.type == .generator || method.type == .asyncGenerator
+                let isAsync = method.type == .async || method.type == .asyncGenerator
+                let head: Instruction
+
+                guard let key = method.key.body else {
+                    throw CompilerError.invalidNodeError("Missing key in class property")
+                }
+                switch key {
+                case .name(let name):
+                    head = emit(
+                        BeginClassMethod(
+                            methodName: name, parameters: parameters, isStatic: method.isStatic,
+                            isGenerator: isGenerator, isAsync: isAsync),
+                        withInputs: defaultValues)
+                case .privateName(let name):
+                    head = emit(
+                        BeginClassPrivateMethod(
+                            methodName: name, parameters: parameters, isStatic: method.isStatic,
+                            isGenerator: isGenerator, isAsync: isAsync),
+                        withInputs: defaultValues)
+                case .index(let index):
+                    head = emit(
+                        BeginClassMethod(
+                            methodName: String(index), parameters: parameters,
+                            isStatic: method.isStatic, isGenerator: isGenerator, isAsync: isAsync),
+                        withInputs: defaultValues)
+                case .expression:
+                    head = emit(
+                        BeginClassComputedMethod(
+                            parameters: parameters, isStatic: method.isStatic,
+                            isGenerator: isGenerator, isAsync: isAsync),
+                        withInputs: [computedKeys.removeLast()] + defaultValues)
+                }
+
+                try enterNewScope {
+                    var parameters = head.innerOutputs
+                    map("this", to: parameters.removeFirst())
+                    try mapParameters(method.parameters, to: parameters)
+                    for statement in method.body {
+                        try compileStatement(statement)
+                    }
+                }
+
+                switch key {
+                case .name, .index:
+                    emit(EndClassMethod())
+                case .privateName:
+                    emit(EndClassPrivateMethod())
+                case .expression:
+                    emit(EndClassComputedMethod())
+                }
+
+            case .getter(let getter):
+                let head: Instruction
+                guard let key = getter.key.body else {
+                    throw CompilerError.invalidNodeError("Missing key in class getter")
+                }
+                switch key {
+                case .name(let name):
+                    head = emit(BeginClassGetter(propertyName: name, isStatic: getter.isStatic))
+                case .privateName(let name):
+                    head = emit(
+                        BeginClassPrivateGetter(propertyName: name, isStatic: getter.isStatic))
+                case .index(let index):
+                    head = emit(
+                        BeginClassGetter(propertyName: String(index), isStatic: getter.isStatic))
+                case .expression:
+                    head = emit(
+                        BeginClassComputedGetter(isStatic: getter.isStatic),
+                        withInputs: [computedKeys.removeLast()])
+                }
+
+                try enterNewScope {
+                    map("this", to: head.innerOutput)
+                    for statement in getter.body {
+                        try compileStatement(statement)
+                    }
+                }
+
+                switch key {
+                case .name, .index:
+                    emit(EndClassGetter())
+                case .privateName:
+                    emit(EndClassPrivateGetter())
+                case .expression:
+                    emit(EndClassComputedGetter())
+                }
+
+            case .setter(let setter):
+                let head: Instruction
+                guard let key = setter.key.body else {
+                    throw CompilerError.invalidNodeError("Missing key in class setter")
+                }
+                switch key {
+                case .name(let name):
+                    head = emit(BeginClassSetter(propertyName: name, isStatic: setter.isStatic))
+                case .privateName(let name):
+                    head = emit(
+                        BeginClassPrivateSetter(propertyName: name, isStatic: setter.isStatic))
+                case .index(let index):
+                    head = emit(
+                        BeginClassSetter(propertyName: String(index), isStatic: setter.isStatic))
+                case .expression:
+                    head = emit(
+                        BeginClassComputedSetter(isStatic: setter.isStatic),
+                        withInputs: [computedKeys.removeLast()])
+                }
+
+                try enterNewScope {
+                    var parameters = head.innerOutputs
+                    map("this", to: parameters.removeFirst())
+                    map(setter.parameter.name, to: parameters.removeFirst())
+                    assert(parameters.isEmpty)
+                    for statement in setter.body {
+                        try compileStatement(statement)
+                    }
+                }
+
+                switch key {
+                case .name, .index:
+                    emit(EndClassSetter())
+                case .privateName:
+                    emit(EndClassPrivateSetter())
+                case .expression:
+                    emit(EndClassComputedSetter())
+                }
+
+            case .staticInitializer(let staticInitializer):
+                let head = emit(BeginClassStaticInitializer())
+
+                try enterNewScope {
+                    map("this", to: head.innerOutput)
+                    for statement in staticInitializer.body {
+                        try compileStatement(statement)
+                    }
+                }
+
+                emit(EndClassStaticInitializer())
+            }
+        }
+
+        emit(EndClassDefinition())
+
+        return classDecl.output
+    }
+
+    private func compileInitialDeclarationValue(_ decl: Compiler_Protobuf_VariableDeclarator) throws
+        -> Variable
+    {
+        if decl.hasValue {
+            return try compileExpression(decl.value)
+        } else {
+            // TODO(saelo): consider caching the `undefined` value for future uses
+            return emit(LoadUndefined()).output
+        }
+    }
+
+    private func compileInitialDeclarationValue(_ decl: Compiler_Protobuf_SimpleVariableDeclarator)
+        throws
+        -> Variable
+    {
+        if decl.hasValue {
+            return try compileExpression(decl.value)
+        } else {
+            return emit(LoadUndefined()).output
+        }
+    }
+
+    private func compileStatement(_ node: StatementNode, pendingLabel: String? = nil) throws {
+        guard let stmt = node.statement else {
+            throw CompilerError.invalidASTError("missing concrete statement in statement node")
+        }
+
+        if pendingLabel != nil {
+            switch stmt {
+            case .blockStatement, .ifStatement, .switchStatement, .whileLoop, .doWhileLoop,
+                .forLoop, .forInLoop,
+                .forOfLoop:
+                break
+            default:
+                throw CompilerError.unsupportedFeatureError("Labels are not supported on \(stmt)")
+            }
+        }
+
+        switch stmt {
+
+        case .emptyStatement:
+            break
+
+        case .blockStatement(let blockStatement):
+            let instr = emit(BeginBlockStatement())
+            try enterNewScope(
+                labelToRegister: pendingLabel, labelVariable: instr.innerOutput, isLoop: false
+            ) {
+                for statement in blockStatement.body {
+                    try compileStatement(statement)
+                }
+            }
+            emit(EndBlockStatement())
+
+        case .variableDeclaration(let variableDeclaration):
+            for decl in variableDeclaration.declarations {
+                let initialValue = try compileInitialDeclarationValue(decl)
+
+                let declarationMode: NamedVariableDeclarationMode
+                switch variableDeclaration.kind {
+                case .var:
+                    declarationMode = .var
+                case .let:
+                    declarationMode = .let
+                case .const:
+                    declarationMode = .const
+                case .UNRECOGNIZED(let type):
+                    throw CompilerError.invalidNodeError(
+                        "invalid variable declaration type \(type)")
+                }
+
+                switch decl.id {
+                case .name(let name):
+                    let v = emit(
+                        CreateNamedVariable(name, declarationMode: declarationMode),
+                        withInputs: [initialValue]
+                    ).output
+                    // Variables declared with .var are allowed to overwrite each other.
+                    assert(!currentScope.keys.contains(name) || declarationMode == .var)
+                    mapOrRemap(name, to: v)
+                case .objectPattern(let objectPattern):
+                    var inputs = [initialValue]
+                    var outputs = [String]()
+                    let patternProto = Compiler_Protobuf_DestructuringPattern.with {
+                        $0.objectPattern = objectPattern
+                    }
+                    let pattern = try compileDestructuringPattern(
+                        patternProto, inputs: &inputs, outputs: &outputs, isReassignment: false)
+                    let destOp = Destruct(
+                        pattern: pattern, numInputs: inputs.count, numOutputs: pattern.numBindings)
+                    let outVars = emit(destOp, withInputs: inputs).outputs
+                    for (name, v) in zip(outputs, outVars) {
+                        assert(!currentScope.keys.contains(name) || declarationMode == .var)
+                        mapOrRemap(name, to: v)
+                    }
+                case .arrayPattern(let arrayPattern):
+                    var inputs = [initialValue]
+                    var outputs = [String]()
+                    let patternProto = Compiler_Protobuf_DestructuringPattern.with {
+                        $0.arrayPattern = arrayPattern
+                    }
+                    let pattern = try compileDestructuringPattern(
+                        patternProto, inputs: &inputs, outputs: &outputs, isReassignment: false)
+                    let destOp = Destruct(
+                        pattern: pattern, numInputs: inputs.count, numOutputs: pattern.numBindings)
+                    let outVars = emit(destOp, withInputs: inputs).outputs
+                    for (name, v) in zip(outputs, outVars) {
+                        assert(!currentScope.keys.contains(name) || declarationMode == .var)
+                        mapOrRemap(name, to: v)
+                    }
+                case nil:
+                    throw CompilerError.invalidASTError("VariableDeclarator is missing its id")
+                }
+            }
+
+        case .disposableVariableDeclaration(let variableDeclaration):
+            for decl in variableDeclaration.declarations {
+                let initialValue = try compileInitialDeclarationValue(decl)
+
+                let v: Variable
+                switch variableDeclaration.kind {
+                case .using:
+                    v =
+                        emit(CreateNamedDisposableVariable(decl.name), withInputs: [initialValue])
+                        .output
+                case .awaitUsing:
+                    v =
+                        emit(
+                            CreateNamedAsyncDisposableVariable(decl.name),
+                            withInputs: [initialValue]
+                        ).output
+                case .UNRECOGNIZED(let type):
+                    throw CompilerError.invalidNodeError(
+                        "invalid disposable variable declaration type \(type)")
+                }
+                assert(!currentScope.keys.contains(decl.name))
+                mapOrRemap(decl.name, to: v)
+            }
+
+        case .functionDeclaration(let functionDeclaration):
+            let defaultValues = try compileDefaultValues(for: functionDeclaration.parameters)
+            let parameters = try convertParameters(functionDeclaration.parameters)
+            let functionBegin: Operation
+            let functionEnd: Operation
+            switch functionDeclaration.type {
+            case .plain:
+                functionBegin = BeginPlainFunction(
+                    parameters: parameters, functionName: functionDeclaration.name)
+                functionEnd = EndPlainFunction()
+            case .generator:
+                functionBegin = BeginGeneratorFunction(
+                    parameters: parameters, functionName: functionDeclaration.name)
+                functionEnd = EndGeneratorFunction()
+            case .async:
+                functionBegin = BeginAsyncFunction(
+                    parameters: parameters, functionName: functionDeclaration.name)
+                functionEnd = EndAsyncFunction()
+            case .asyncGenerator:
+                functionBegin = BeginAsyncGeneratorFunction(
+                    parameters: parameters, functionName: functionDeclaration.name)
+                functionEnd = EndAsyncGeneratorFunction()
+            case .UNRECOGNIZED(let type):
+                throw CompilerError.invalidNodeError("invalid function declaration type \(type)")
+            }
+
+            let instr = emit(functionBegin, withInputs: defaultValues)
+            // The function may have been accessed before it was defined due to function hoisting, so
+            // here we may overwrite an existing variable mapping.
+            mapOrRemap(functionDeclaration.name, to: instr.output)
+            try enterNewScope {
+                try mapParameters(functionDeclaration.parameters, to: instr.innerOutputs)
+                for statement in functionDeclaration.body {
+                    try compileStatement(statement)
+                }
+            }
+            emit(functionEnd)
+
+        case .classDeclaration(let classDeclaration):
+            let superClass = classDeclaration.hasSuperClass ? classDeclaration.superClass : nil
+            try compileClass(
+                classDeclaration.name, superClass: superClass, fields: classDeclaration.fields,
+                isExpression: false)
+
+        case .returnStatement(let returnStatement):
+            if returnStatement.hasArgument {
+                let value = try compileExpression(returnStatement.argument)
+                emit(Return(hasReturnValue: true), withInputs: [value])
+            } else {
+                emit(Return(hasReturnValue: false))
+            }
+
+        case .directiveStatement(let directiveStatement):
+            emit(Directive(directiveStatement.content))
+
+        case .expressionStatement(let expressionStatement):
+            try compileExpression(expressionStatement.expression)
+
+        case .ifStatement(let ifStatement):
+            let test = try compileExpression(ifStatement.test)
+            let beginIf = emit(BeginIf(inverted: false), withInputs: [test])
+            try enterNewScope(
+                labelToRegister: pendingLabel, labelVariable: beginIf.innerOutput, isLoop: false
+            ) {
+                try compileBody(ifStatement.ifBody)
+            }
+            if ifStatement.hasElseBody {
+                let beginElse = emit(BeginElse())
+                try enterNewScope(
+                    labelToRegister: pendingLabel, labelVariable: beginElse.innerOutput,
+                    isLoop: false
+                ) {
+                    try compileBody(ifStatement.elseBody)
+                }
+            }
+            emit(EndIf())
+
+        case .whileLoop(let whileLoop):
+            emit(BeginWhileLoopHeader())
+            var loopLabelVariable: Variable? = nil
+
+            try enterNewScope {
+                let cond = try compileExpression(whileLoop.test)
+                let instr = emit(BeginWhileLoopBody(), withInputs: [cond])
+                loopLabelVariable = instr.innerOutput
+            }
+
+            try enterNewScope(
+                labelToRegister: pendingLabel, labelVariable: loopLabelVariable, isLoop: true
+            ) {
+                try compileBody(whileLoop.body)
+            }
+
+            emit(EndWhileLoop())
+
+        case .doWhileLoop(let doWhileLoop):
+            let instr = emit(BeginDoWhileLoopBody())
+
+            try enterNewScope(
+                labelToRegister: pendingLabel, labelVariable: instr.innerOutput, isLoop: true
+            ) {
+                try compileBody(doWhileLoop.body)
+            }
+
+            emit(BeginDoWhileLoopHeader())
+
+            try enterNewScope {
+                let cond = try compileExpression(doWhileLoop.test)
+                emit(EndDoWhileLoop(), withInputs: [cond])
+            }
+
+        case .forLoop(let forLoop):
+            var loopVariables = [String]()
+
+            // Process initializer.
+            var initialLoopVariableValues = [Variable]()
+            emit(BeginForLoopInitializer())
+            try enterNewScope {
+                if let initializer = forLoop.initializer {
+                    switch initializer {
+                    case .declaration(let declaration):
+                        for declarator in declaration.declarations {
+                            loopVariables.append(declarator.name)
+                            initialLoopVariableValues.append(
+                                try compileExpression(declarator.value))
+                        }
+                    case .expression(let expression):
+                        try compileExpression(expression)
+                    }
+                }
+            }
+
+            // Process condition.
+            var outputs = emit(
+                BeginForLoopCondition(numLoopVariables: loopVariables.count),
+                withInputs: initialLoopVariableValues
+            ).innerOutputs
+            var cond: Variable? = nil
+            try enterNewScope {
+                zip(loopVariables, outputs).forEach({ map($0, to: $1) })
+                if forLoop.hasCondition {
+                    cond = try compileExpression(forLoop.condition)
+                } else {
+                    cond = emit(LoadBoolean(value: true)).output
+                }
+            }
+
+            // Process afterthought.
+            outputs =
+                emit(
+                    BeginForLoopAfterthought(numLoopVariables: loopVariables.count),
+                    withInputs: [cond!]
+                ).innerOutputs
+            try enterNewScope {
+                zip(loopVariables, outputs).forEach({ map($0, to: $1) })
+                if forLoop.hasAfterthought {
+                    try compileExpression(forLoop.afterthought)
+                }
+            }
+
+            // Process body
+            let bodyInstr = emit(BeginForLoopBody(numLoopVariables: loopVariables.count))
+            outputs = bodyInstr.innerOutputs.dropLast()
+            let loopLabelVariable = bodyInstr.innerOutputs.last!
+
+            try enterNewScope(
+                labelToRegister: pendingLabel, labelVariable: loopLabelVariable, isLoop: true
+            ) {
+                zip(loopVariables, outputs).forEach({ map($0, to: $1) })
+                try compileBody(forLoop.body)
+            }
+
+            emit(EndForLoop())
+
+        case .forInLoop(let forInLoop):
+            let obj = try compileExpression(forInLoop.right)
+
+            let instr = emit(ForLoop(type: .forIn), withInputs: [obj])
+            let loopVar = instr.innerOutput(0)
+            let loopLabelVariable = instr.innerOutput(1)
+            try enterNewScope(
+                labelToRegister: pendingLabel, labelVariable: loopLabelVariable, isLoop: true
+            ) {
+                switch forInLoop.left {
+                case .declaration(let decl):
+                    guard !decl.hasValue else {
+                        throw CompilerError.invalidNodeError(
+                            "Expected no initial value for the variable declared in a for-in loop")
+                    }
+                    map(decl.name, to: loopVar)
+                case .lvalue(let lvalueWrapper):
+                    guard let value = lvalueWrapper.value else {
+                        throw CompilerError.invalidNodeError("Missing lvalue in for-in loop")
+                    }
+                    try emitReassignment(lvalue: value, rhs: loopVar, assignmentOperator: nil)
+                case nil:
+                    throw CompilerError.invalidNodeError("Missing left side of for-in loop")
+                }
+                try compileBody(forInLoop.body)
+            }
+
+            emit(EndForLoop())
+
+        case .forOfLoop(let forOfLoop):
+            let obj = try compileExpression(forOfLoop.right)
+
+            switch forOfLoop.left {
+            case .declaration(let initializer):
+                if forOfLoop.usingType != .none {
+                    guard case .name = initializer.id else {
+                        throw CompilerError.invalidNodeError(
+                            "using declarations cannot be destructured")
+                    }
+                }
+
+                guard !initializer.hasValue else {
+                    throw CompilerError.invalidNodeError(
+                        "Expected no initial value for the variable declared in a for-of loop")
+                }
+
+                guard let id = initializer.id else {
+                    throw CompilerError.invalidNodeError(
+                        "Variable declarator missing id in for-of loop")
+                }
+
+                switch id {
+                case .name(let name):
+                    let usingType: UsingType =
+                        switch forOfLoop.usingType {
+                        case .using: .using
+                        case .awaitUsing: .awaitUsing
+                        case .none: .none
+                        case .UNRECOGNIZED(let type):
+                            throw CompilerError.invalidNodeError("Unrecognized using type \(type)")
+                        }
+
+                    let instr = emit(
+                        ForLoop(
+                            type: .forOf, isAsync: forOfLoop.isAsync,
+                            usingType: usingType,
+                            header: .simple),
+                        withInputs: [obj])
+                    let loopVar = instr.innerOutput(0)
+                    let loopLabelVariable = instr.innerOutput(1)
+                    try enterNewScope(
+                        labelToRegister: pendingLabel, labelVariable: loopLabelVariable,
+                        isLoop: true
+                    ) {
+                        map(name, to: loopVar)
+                        try compileBody(forOfLoop.body)
+                    }
+
+                case .objectPattern(let pattern):
+                    try assertNoUsing(
+                        forOfLoop.usingType, message: "using declarations cannot be destructured")
+                    var inputs = [Variable]()
+                    var outputs = [String]()
+                    let patternProto = Compiler_Protobuf_DestructuringPattern.with {
+                        $0.objectPattern = pattern
+                    }
+                    let destPattern = try compileDestructuringPattern(
+                        patternProto, inputs: &inputs, outputs: &outputs, isReassignment: false)
+                    let instr = emit(
+                        ForLoop(
+                            type: .forOf, isAsync: forOfLoop.isAsync,
+                            usingType: .none,
+                            header: .destruct(pattern: destPattern),
+                            patternInputs: inputs.count),
+                        withInputs: [obj] + inputs)
+
+                    let loopLabelVariable = instr.innerOutputs.last!
+                    let vars = Array(instr.innerOutputs.dropLast())
+
+                    try enterNewScope(
+                        labelToRegister: pendingLabel, labelVariable: loopLabelVariable,
+                        isLoop: true
+                    ) {
+                        for (i, name) in outputs.enumerated() {
+                            map(name, to: vars[i])
+                        }
+                        try compileBody(forOfLoop.body)
+                    }
+
+                case .arrayPattern(let pattern):
+                    try assertNoUsing(
+                        forOfLoop.usingType, message: "using declarations cannot be destructured")
+                    var inputs = [Variable]()
+                    var outputs = [String]()
+                    let patternProto = Compiler_Protobuf_DestructuringPattern.with {
+                        $0.arrayPattern = pattern
+                    }
+                    let destPattern = try compileDestructuringPattern(
+                        patternProto, inputs: &inputs, outputs: &outputs, isReassignment: false)
+                    let instr = emit(
+                        ForLoop(
+                            type: .forOf, isAsync: forOfLoop.isAsync,
+                            usingType: .none,
+                            header: .destruct(pattern: destPattern),
+                            patternInputs: inputs.count),
+                        withInputs: [obj] + inputs)
+
+                    let loopLabelVariable = instr.innerOutputs.last!
+                    let vars = Array(instr.innerOutputs.dropLast())
+
+                    try enterNewScope(
+                        labelToRegister: pendingLabel, labelVariable: loopLabelVariable,
+                        isLoop: true
+                    ) {
+                        for (i, name) in outputs.enumerated() {
+                            map(name, to: vars[i])
+                        }
+                        try compileBody(forOfLoop.body)
+                    }
+                }
+
+            case .lvalue(let lvalueWrapper):
+                guard let value = lvalueWrapper.value else {
+                    throw CompilerError.invalidNodeError("Missing lvalue in for-of loop")
+                }
+                try assertNoUsing(
+                    forOfLoop.usingType, message: "Reassignment loops cannot have a using modifier")
+
+                let instr = emit(
+                    ForLoop(
+                        type: .forOf, isAsync: forOfLoop.isAsync,
+                        usingType: .none,
+                        header: .simple),
+                    withInputs: [obj])
+                let loopVar = instr.innerOutput(0)
+                let loopLabelVariable = instr.innerOutput(1)
+                try enterNewScope(
+                    labelToRegister: pendingLabel, labelVariable: loopLabelVariable, isLoop: true
+                ) {
+                    try emitReassignment(lvalue: value, rhs: loopVar, assignmentOperator: nil)
+                    try compileBody(forOfLoop.body)
+                }
+
+            case nil:
+                throw CompilerError.invalidNodeError("Missing left side of for-of loop")
+            }
+
+            emit(EndForLoop())
+
+        case .breakStatement(let breakStatement):
+            if !breakStatement.label.isEmpty {
+                guard let (labelVar, isLoop) = lookupLabel(breakStatement.label) else {
+                    throw CompilerError.invalidNodeError("unknown label: \(breakStatement.label)")
+                }
+
+                if isLoop {
+                    emit(LoopBreak(hasLabel: true), withInputs: [labelVar])
+                } else {
+                    emit(BlockBreak(), withInputs: [labelVar])
+                }
+            } else {
+                // If we're in both .loop and .switch context, then the loop must be the most recent context
+                // (switch blocks don't propagate an outer .loop context) so we just need to check for .loop here
+                if contextAnalyzer.context.contains(.loop) {
+                    emit(LoopBreak())
+                } else if contextAnalyzer.context.contains(.switchCase) {
+                    emit(SwitchBreak())
+                } else {
+                    throw CompilerError.invalidNodeError(
+                        "break statement outside of loop or switch")
+                }
+            }
+
+        case .continueStatement(let continueStatement):
+            if !continueStatement.label.isEmpty {
+                guard let (labelVar, isLoop) = lookupLabel(continueStatement.label) else {
+                    throw CompilerError.invalidNodeError(
+                        "unknown label: \(continueStatement.label)")
+                }
+                guard isLoop else {
+                    throw CompilerError.invalidNodeError(
+                        "continue statement with non-loop label: \(continueStatement.label)")
+                }
+                emit(LoopContinue(hasLabel: true), withInputs: [labelVar])
+            } else {
+                emit(LoopContinue())
+            }
+
+        case .tryStatement(let tryStatement):
+            emit(BeginTry())
+            try enterNewScope {
+                for statement in tryStatement.body {
+                    try compileStatement(statement)
+                }
+            }
+            if tryStatement.hasCatch {
+                try enterNewScope {
+                    let beginCatch = emit(BeginCatch())
+                    if tryStatement.catch.hasParameter {
+                        map(tryStatement.catch.parameter.name, to: beginCatch.innerOutput)
+                    }
+                    for statement in tryStatement.catch.body {
+                        try compileStatement(statement)
+                    }
+                }
+            }
+            if tryStatement.hasFinally {
+                try enterNewScope {
+                    emit(BeginFinally())
+                    for statement in tryStatement.finally.body {
+                        try compileStatement(statement)
+                    }
+                }
+            }
+            emit(EndTryCatchFinally())
+
+        case .throwStatement(let throwStatement):
+            let value = try compileExpression(throwStatement.argument)
+            emit(ThrowException(), withInputs: [value])
+
+        case .withStatement(let withStatement):
+            let object = try compileExpression(withStatement.object)
+            emit(BeginWith(), withInputs: [object])
+            try enterNewScope {
+                try compileBody(withStatement.body)
+            }
+            emit(EndWith())
+
+        case .switchStatement(let switchStatement):
+            // TODO Replace the precomputation of tests with compilation of the test expressions in the cases.
+            // To do this, we would need to redesign Switch statements in FuzzIL to (for example) have a BeginSwitchCaseHead, BeginSwitchCaseBody, and EndSwitchCase.
+            // Then the expression would go inside the header.
+            var precomputedTests = [Variable]()
+            for caseStatement in switchStatement.cases {
+                if caseStatement.hasTest {
+                    let test = try compileExpression(caseStatement.test)
+                    precomputedTests.append(test)
+                }
+            }
+            let discriminant = try compileExpression(switchStatement.discriminant)
+            let instr = emit(BeginSwitch(), withInputs: [discriminant])
+            try enterNewScope(
+                labelToRegister: pendingLabel, labelVariable: instr.innerOutput, isLoop: false
+            ) {
+                for caseStatement in switchStatement.cases {
+                    if caseStatement.hasTest {
+                        emit(BeginSwitchCase(), withInputs: [precomputedTests.removeFirst()])
+                    } else {
+                        emit(BeginSwitchDefaultCase())
+                    }
+                    try enterNewScope {
+                        for statement in caseStatement.consequent {
+                            try compileStatement(statement)
+                        }
+                    }
+                    // We could also do an optimization here where we check if the last statement in the case is a break, and if so, we drop the last instruction
+                    // and set the fallsThrough flag to false.
+                    emit(EndSwitchCase(fallsThrough: true))
+                }
+            }
+            emit(EndSwitch())
+
+        case .labeledStatement(let labeledStatement):
+            try compileStatement(labeledStatement.body, pendingLabel: labeledStatement.label)
+        }
+    }
+
+    // This is essentially the same as compileStatement except that it skips a top-level BlockStatement:
+    // For example, the body of a loop is a single statement. If the body consists of multiple statements
+    // then the "top-level" statement is a BlockStatement. When compiling such code to FuzzIL, that
+    // top-level BlockStatement should be skipped as it would otherwise turn into a separate Begin/EndBlock.
+    // This does not modify the current scope, the caller is expected to do that.
+    private func compileBody(_ statement: StatementNode) throws {
+        if case .blockStatement(let blockStatement) = statement.statement {
+            for statement in blockStatement.body {
+                try compileStatement(statement)
+            }
+        } else {
+            try compileStatement(statement)
+        }
+    }
+
+    private func findOrCreateVariable(_ name: String) -> Variable {
+        // If we can't find the variable in the current scopes, we assume it is an access to a
+        // global variable/builtin or a hoisted variable access. In that case, create a named variable.
+        return lookupIdentifier(name)
+            ?? emit(CreateNamedVariable(name, declarationMode: .none)).output
+    }
+
+    private func assertNoUsing(
+        _ usingType: Compiler_Protobuf_ForOfLoop.UsingType, message: String
+    )
+        throws
+    {
+        guard usingType == .none else {
+            throw CompilerError.invalidNodeError(message)
+        }
+    }
+
+    private func emitReassignment(
+        lvalue: Compiler_Protobuf_LValue.OneOf_Value, rhs: Variable,
+        assignmentOperator: BinaryOperator?
+    ) throws {
+        switch lvalue {
+        case .memberExpression(let memberExpression):
+            // Compile to a Set- or Update{Property/Element/ComputedProperty} operation
+            let object = try compileExpression(memberExpression.object)
+            guard let property = memberExpression.property else {
+                throw CompilerError.invalidNodeError(
+                    "missing property in member expression")
+            }
+            switch property {
+            case .name(let name):
+                if let op = assignmentOperator {
+                    emit(
+                        UpdateProperty(propertyName: name, operator: op), withInputs: [object, rhs])
+                } else {
+                    emit(
+                        SetProperty(propertyName: name, isGuarded: memberExpression.isOptional),
+                        withInputs: [object, rhs])
+                }
+            case .privateName(let name):
+                if let op = assignmentOperator {
+                    emit(
+                        UpdatePrivateProperty(propertyName: name, operator: op),
+                        withInputs: [object, rhs])
+                } else {
+                    emit(
+                        SetPrivateProperty(
+                            propertyName: name, isGuarded: memberExpression.isOptional),
+                        withInputs: [object, rhs])
+                }
+            case .expression(let expr):
+                // SetElement requires an Int64
+                // so if `Int64(exactly:)` returns nil, we fall back to SetComputedProperty.
+                if case .numberLiteral(let literal) = expr.expression,
+                    let index = Int64(exactly: literal.value)
+                {
+                    if let op = assignmentOperator {
+                        emit(
+                            UpdateElement(index: index, operator: op),
+                            withInputs: [object, rhs])
+                    } else {
+                        emit(SetElement(index: index), withInputs: [object, rhs])
+                    }
+                } else {
+                    let property = try compileExpression(expr)
+                    if let op = assignmentOperator {
+                        emit(
+                            UpdateComputedProperty(operator: op),
+                            withInputs: [object, property, rhs])
+                    } else {
+                        emit(SetComputedProperty(), withInputs: [object, property, rhs])
+                    }
+                }
+            }
+
+        case .superMemberExpression(let superMemberExpression):
+            guard superMemberExpression.isOptional == false else {
+                throw CompilerError.unsupportedFeatureError(
+                    "Optional chaining is not supported in super member expressions")
+            }
+
+            guard let property = superMemberExpression.property else {
+                throw CompilerError.invalidNodeError(
+                    "Missing property in super member expression")
+            }
+
+            switch property {
+            case .name(let name):
+                if let op = assignmentOperator {
+                    // Example: super.foo += 1
+                    emit(
+                        UpdateSuperProperty(propertyName: name, operator: op),
+                        withInputs: [rhs]
+                    )
+                } else {
+                    // Example: super.foo = 1
+                    emit(SetSuperProperty(propertyName: name), withInputs: [rhs])
+                }
+
+            case .expression(let expr):
+                let property = try compileExpression(expr)
+                // Example: super[expr] = 1
+                emit(SetComputedSuperProperty(), withInputs: [property, rhs])
+            }
+
+        case .identifier(let identifier):
+            // Lookup the variable. If not found, it's likely a global or implicit
+            // declaration, so we synthesize a new FuzzIL Variable to represent it.
+            let lhs =
+                findOrCreateVariable(identifier.name)
+
+            // Compile to a Reassign or Update operation
+            if let op = assignmentOperator {
+                emit(Update(op), withInputs: [lhs, rhs])
+            } else {
+                // TODO(saelo): if we're assigning to a named variable, we could also generate a declaration
+                // of a global variable here instead. Probably it doeesn't matter in practice though.
+                emit(Reassign(), withInputs: [lhs, rhs])
+            }
+
+        case .destructuringPattern(let pattern):
+            guard assignmentOperator == nil else {
+                throw CompilerError.invalidNodeError(
+                    "Compound assignment is not allowed with destructuring patterns")
+            }
+            var inputs = [Variable]()
+            var outputs = [String]()
+            let destPattern = try compileDestructuringPattern(
+                pattern, inputs: &inputs, outputs: &outputs, isReassignment: true)
+            emit(
+                DestructAndReassign(pattern: destPattern, numInputs: inputs.count + 1),
+                withInputs: [rhs] + inputs)
+        }
+    }
+
+    @discardableResult
+    private func compileExpression(_ node: ExpressionNode) throws -> Variable {
+        guard let expr = node.expression else {
+            throw CompilerError.invalidASTError("missing concrete expression in expression node")
+        }
+
+        switch expr {
+
+        case .classExpression(let classExpression):
+            let superClass = classExpression.hasSuperClass ? classExpression.superClass : nil
+            return try compileClass(
+                classExpression.name, superClass: superClass, fields: classExpression.fields,
+                isExpression: true)
+
+        case .ternaryExpression(let ternaryExpression):
+            let condition = try compileExpression(ternaryExpression.condition)
+            let consequent = try compileExpression(ternaryExpression.consequent)
+            let alternate = try compileExpression(ternaryExpression.alternate)
+            return emit(TernaryOperation(), withInputs: [condition, consequent, alternate]).output
+
+        case .identifier(let identifier):
+            // Identifiers can generally turn into one of three things:
+            //  1. A FuzzIL variable that has previously been associated with the identifier
+            //  2. A LoadUndefined or LoadArguments operations if the identifier is "undefined" or "arguments" respectively
+            //  3. A CreateNamedVariable operation in all other cases (typically global or hoisted variables, but could also be properties in a with statement)
+
+            // We currently fall-back to case 3 if none of the other works. However, this isn't quite correct as it would incorrectly deal with e.g.
+            //
+            // let v = 42;
+            // function foo() {
+            //     v = 5;
+            //     var v = 3;
+            // }
+            // foo()
+            //
+            // As the `v = 5` would end up changing the outer variable.
+            // TODO To deal with this correctly, we'd have to walk over the AST twice.
+
+            // Case 1
+            if let v = lookupIdentifier(identifier.name) {
+                return v
+            }
+
+            // Case 2
+            assert(identifier.name != "this")  // This is handled via ThisExpression
+            if identifier.name == "undefined" {
+                return emit(LoadUndefined()).output
+            } else if identifier.name == "arguments" {
+                return emit(LoadArguments()).output
+            }
+
+            // Case 3
+            let v = emit(CreateNamedVariable(identifier.name, declarationMode: .none)).output
+            // Cache the variable in case it is reused again to avoid emitting multiple
+            // CreateNamedVariable operations for the same variable.
+            map(identifier.name, to: v)
+            return v
+
+        case .numberLiteral(let literal):
+            if let intValue = Int64(exactly: literal.value) {
+                return emit(LoadInteger(value: intValue)).output
+            } else {
+                return emit(LoadFloat(value: literal.value)).output
+            }
+
+        case .bigIntLiteral(let literal):
+            if let intValue = Int64(literal.value) {
+                return emit(LoadBigInt(value: intValue)).output
+            } else {
+                // TODO should LoadBigInt support larger integer values (represented as string)?
+                let stringValue = emit(LoadString(value: literal.value)).output
+                let BigInt = emit(CreateNamedVariable("BigInt", declarationMode: .none)).output
+                return emit(
+                    CallFunction(numArguments: 1, isGuarded: false),
+                    withInputs: [BigInt, stringValue]
+                ).output
+            }
+
+        case .stringLiteral(let literal):
+            let value = literal.value.replacingOccurrences(of: "\n", with: "\\n")
+            return emit(LoadString(value: value)).output
+
+        case .templateLiteral(let templateLiteral):
+            let interpolatedValues = try templateLiteral.expressions.map(compileExpression)
+            let parts = templateLiteral.parts.map({ $0.replacingOccurrences(of: "\n", with: "\\n") }
+            )
+            return emit(CreateTemplateString(parts: parts), withInputs: interpolatedValues).output
+
+        case .regExpLiteral(let literal):
+            guard let flags = RegExpFlags.fromString(literal.flags) else {
+                throw CompilerError.invalidNodeError("invalid RegExp flags: \(literal.flags)")
+            }
+            return emit(LoadRegExp(pattern: literal.pattern, flags: flags)).output
+
+        case .booleanLiteral(let literal):
+            return emit(LoadBoolean(value: literal.value)).output
+
+        case .nullLiteral:
+            return emit(LoadNull()).output
+
+        case .thisExpression:
+            // Check if `this` is currently mapped to a FuzzIL variable (e.g. if we're inside an object- or class method).
+            if let v = lookupIdentifier("this") {
+                return v
+            }
+            // Otherwise, emit a LoadThis.
+            return emit(LoadThis()).output
+
+        case .assignmentExpression(let assignmentExpression):
+            guard let value = assignmentExpression.lvalue.value else {
+                throw CompilerError.invalidNodeError("Missing lvalue in assignment expression")
+            }
+            let rhs = try compileExpression(assignmentExpression.rhs)
+
+            let assignmentOperator: BinaryOperator?
+            switch assignmentExpression.operator {
+            case "=":
+                assignmentOperator = nil
+            default:
+                // It's something like "+=", "-=", etc.
+                let binaryOperator = String(assignmentExpression.operator.dropLast())
+                guard let op = BinaryOperator(rawValue: binaryOperator) else {
+                    throw CompilerError.invalidNodeError(
+                        "Unknown assignment operator \(assignmentExpression.operator)")
+                }
+                assignmentOperator = op
+            }
+
+            try emitReassignment(lvalue: value, rhs: rhs, assignmentOperator: assignmentOperator)
+
+            return rhs
+
+        case .objectExpression(let objectExpression):
+            // The expressions for property values, computed properties and method default parameters need to be emitted before the object literal is opened.
+            var propertyValues = [Variable]()
+            var computedKeys = [Variable]()
+            var methodDefaultValues = [[Variable]]()
+            for field in objectExpression.fields {
+                guard let field = field.field else {
+                    throw CompilerError.invalidNodeError(
+                        "missing concrete field in object expression")
+                }
+
+                let key: Compiler_Protobuf_PropertyKey
+                switch field {
+                case .property(let property):
+                    propertyValues.append(try compileExpression(property.value))
+                    key = property.key
+                case .method(let method):
+                    methodDefaultValues.append(try compileDefaultValues(for: method.parameters))
+                    key = method.key
+                case .getter(let getter):
+                    key = getter.key
+                case .setter(let setter):
+                    key = setter.key
+                }
+                if case .expression(let expression) = key.body {
+                    computedKeys.append(try compileExpression(expression))
+                }
+            }
+
+            // Reverse the arrays since we'll remove the elements in FIFO order.
+            propertyValues.reverse()
+            computedKeys.reverse()
+            methodDefaultValues.reverse()
+
+            // Now build the object literal.
+            emit(BeginObjectLiteral())
+            for field in objectExpression.fields {
+                switch field.field! {
+                case .property(let property):
+                    guard let key = property.key.body else {
+                        throw CompilerError.invalidNodeError(
+                            "missing key in object expression field")
+                    }
+                    let inputs = [propertyValues.removeLast()]
+                    switch key {
+                    case .name(let name):
+                        emit(ObjectLiteralAddProperty(propertyName: name), withInputs: inputs)
+                    case .index(let index):
+                        emit(ObjectLiteralAddElement(index: index), withInputs: inputs)
+                    case .expression:
+                        emit(
+                            ObjectLiteralAddComputedProperty(),
+                            withInputs: [computedKeys.removeLast()] + inputs)
+                    case .privateName:
+                        throw CompilerError.invalidNodeError(
+                            "Private properties are not valid in object literals")
+                    }
+                case .method(let method):
+                    let defaultValues = methodDefaultValues.removeLast()
+                    let parameters = try convertParameters(method.parameters)
+                    let isGenerator = method.type == .generator || method.type == .asyncGenerator
+                    let isAsync = method.type == .async || method.type == .asyncGenerator
+                    let head: Instruction
+
+                    guard let key = method.key.body else {
+                        throw CompilerError.invalidNodeError(
+                            "Missing key in object expression method")
+                    }
+                    switch key {
+                    case .name(let name):
+                        head = emit(
+                            BeginObjectLiteralMethod(
+                                methodName: name, parameters: parameters, isGenerator: isGenerator,
+                                isAsync: isAsync),
+                            withInputs: defaultValues)
+                    case .index(let index):
+                        head = emit(
+                            BeginObjectLiteralMethod(
+                                methodName: String(index), parameters: parameters,
+                                isGenerator: isGenerator, isAsync: isAsync),
+                            withInputs: defaultValues)
+                    case .expression:
+                        head = emit(
+                            BeginObjectLiteralComputedMethod(
+                                parameters: parameters, isGenerator: isGenerator, isAsync: isAsync),
+                            withInputs: [computedKeys.removeLast()] + defaultValues)
+                    case .privateName:
+                        throw CompilerError.invalidNodeError(
+                            "Private properties are not valid in object literals")
+                    }
+
+                    try enterNewScope {
+                        var parameters = head.innerOutputs
+                        map("this", to: parameters.removeFirst())
+                        try mapParameters(method.parameters, to: parameters)
+                        for statement in method.body {
+                            try compileStatement(statement)
+                        }
+                    }
+
+                    switch key {
+                    case .name, .index:
+                        emit(EndObjectLiteralMethod())
+                    case .expression:
+                        emit(EndObjectLiteralComputedMethod())
+                    case .privateName:
+                        fatalError("Unreachable")
+                    }
+                case .getter(let getter):
+                    guard let key = getter.key.body else {
+                        throw CompilerError.invalidNodeError(
+                            "Missing key in object expression getter")
+                    }
+                    let head: Instruction
+                    switch key {
+                    case .name(let name):
+                        head = emit(BeginObjectLiteralGetter(propertyName: name))
+                    case .index(let index):
+                        head = emit(BeginObjectLiteralGetter(propertyName: String(index)))
+                    case .expression:
+                        head = emit(
+                            BeginObjectLiteralComputedGetter(),
+                            withInputs: [computedKeys.removeLast()])
+                    case .privateName:
+                        throw CompilerError.invalidNodeError(
+                            "Private properties are not valid in object literals")
+                    }
+                    try enterNewScope {
+                        map("this", to: head.innerOutput)
+                        for statement in getter.body {
+                            try compileStatement(statement)
+                        }
+                    }
+                    switch key {
+                    case .name, .index:
+                        emit(EndObjectLiteralGetter())
+                    case .expression:
+                        emit(EndObjectLiteralComputedGetter())
+                    case .privateName:
+                        fatalError("Unreachable")
+                    }
+                case .setter(let setter):
+                    guard let key = setter.key.body else {
+                        throw CompilerError.invalidNodeError(
+                            "Missing key in object expression setter")
+                    }
+                    let head: Instruction
+                    switch key {
+                    case .name(let name):
+                        head = emit(BeginObjectLiteralSetter(propertyName: name))
+                    case .index(let index):
+                        head = emit(BeginObjectLiteralSetter(propertyName: String(index)))
+                    case .expression:
+                        head = emit(
+                            BeginObjectLiteralComputedSetter(),
+                            withInputs: [computedKeys.removeLast()])
+                    case .privateName:
+                        throw CompilerError.invalidNodeError(
+                            "Private properties are not valid in object literals")
+                    }
+                    try enterNewScope {
+                        var parameters = head.innerOutputs
+                        map("this", to: parameters.removeFirst())
+                        map(setter.parameter.name, to: parameters.removeFirst())
+                        assert(parameters.isEmpty)
+                        for statement in setter.body {
+                            try compileStatement(statement)
+                        }
+                    }
+                    switch key {
+                    case .name, .index:
+                        emit(EndObjectLiteralSetter())
+                    case .expression:
+                        emit(EndObjectLiteralComputedSetter())
+                    case .privateName:
+                        fatalError("Unreachable")
+                    }
+                }
+            }
+            return emit(EndObjectLiteral()).output
+
+        case .arrayExpression(let arrayExpression):
+            var elements = [Variable]()
+            var undefined: Variable? = nil
+            var spreads = [Bool]()
+            for elem in arrayExpression.elements {
+                if elem.expression == nil {
+                    if undefined == nil {
+                        undefined = emit(LoadUndefined()).output
+                    }
+                    elements.append(undefined!)
+                    spreads.append(false)
+                } else {
+                    if case .spreadElement(let spreadElement) = elem.expression {
+                        elements.append(try compileExpression(spreadElement.argument))
+                        spreads.append(true)
+                    } else {
+                        elements.append(try compileExpression(elem))
+                        spreads.append(false)
+                    }
+                }
+            }
+            if spreads.contains(true) {
+                return emit(CreateArrayWithSpread(spreads: spreads), withInputs: elements).output
+            } else {
+                return emit(CreateArray(numInitialValues: elements.count), withInputs: elements)
+                    .output
+            }
+
+        case .functionExpression(let functionExpression):
+            let defaultValues = try compileDefaultValues(for: functionExpression.parameters)
+            let parameters = try convertParameters(functionExpression.parameters)
+            let functionBegin: Operation
+            let functionEnd: Operation
+            let name = functionExpression.name.isEmpty ? nil : functionExpression.name
+            switch functionExpression.type {
+            case .plain:
+                functionBegin = BeginPlainFunction(parameters: parameters, functionName: name)
+                functionEnd = EndPlainFunction()
+            case .generator:
+                functionBegin = BeginGeneratorFunction(parameters: parameters, functionName: name)
+                functionEnd = EndGeneratorFunction()
+            case .async:
+                functionBegin = BeginAsyncFunction(parameters: parameters, functionName: name)
+                functionEnd = EndAsyncFunction()
+            case .asyncGenerator:
+                functionBegin = BeginAsyncGeneratorFunction(
+                    parameters: parameters, functionName: name)
+                functionEnd = EndAsyncGeneratorFunction()
+            case .UNRECOGNIZED(let type):
+                throw CompilerError.invalidNodeError("invalid function declaration type \(type)")
+            }
+
+            let instr = emit(functionBegin, withInputs: defaultValues)
+            try enterNewScope {
+                try mapParameters(functionExpression.parameters, to: instr.innerOutputs)
+                for statement in functionExpression.body {
+                    try compileStatement(statement)
+                }
+            }
+            emit(functionEnd)
+
+            return instr.output
+
+        case .arrowFunctionExpression(let arrowFunction):
+            let defaultValues = try compileDefaultValues(for: arrowFunction.parameters)
+            let parameters = try convertParameters(arrowFunction.parameters)
+            let functionBegin: Operation
+            let functionEnd: Operation
+            switch arrowFunction.type {
+            case .plain:
+                functionBegin = BeginArrowFunction(parameters: parameters)
+                functionEnd = EndArrowFunction()
+            case .async:
+                functionBegin = BeginAsyncArrowFunction(parameters: parameters)
+                functionEnd = EndAsyncArrowFunction()
+            default:
+                throw CompilerError.invalidNodeError(
+                    "invalid arrow function type \(arrowFunction.type)")
+            }
+
+            let instr = emit(functionBegin, withInputs: defaultValues)
+            try enterNewScope {
+                try mapParameters(arrowFunction.parameters, to: instr.innerOutputs)
+                guard let body = arrowFunction.body else {
+                    throw CompilerError.invalidNodeError("missing body in arrow function")
+                }
+                switch body {
+                case .block(let block):
+                    try compileBody(block)
+                case .expression(let expr):
+                    let result = try compileExpression(expr)
+                    emit(Return(hasReturnValue: true), withInputs: [result])
+                }
+            }
+            emit(functionEnd)
+
+            return instr.output
+
+        case .callExpression(let callExpression):
+            let (arguments, spreads) = try compileCallArguments(callExpression.arguments)
+            let isSpreading = spreads.contains(true)
+
+            // See if this is a function or a method call
+            if case .memberExpression(let memberExpression) = callExpression.callee.expression {
+                // obj.foo(...) or obj[expr](...)
+                let object = try compileExpression(memberExpression.object)
+                guard let property = memberExpression.property else {
+                    throw CompilerError.invalidNodeError(
+                        "missing property in member expression in call expression")
+                }
+                switch property {
+                case .name(let name):
+                    let operation: Operation
+                    if isSpreading {
+                        operation = CallMethodWithSpread(
+                            methodName: name, numArguments: arguments.count,
+                            spreads: spreads, isGuarded: callExpression.isOptional)
+                    } else {
+                        operation = CallMethod(
+                            methodName: name, numArguments: arguments.count,
+                            isGuarded: callExpression.isOptional)
+                    }
+                    return emit(operation, withInputs: [object] + arguments).output
+                case .privateName(let name):
+                    let operation: Operation
+                    if isSpreading {
+                        operation = CallPrivateMethodWithSpread(
+                            methodName: name, numArguments: arguments.count,
+                            spreads: spreads, isGuarded: callExpression.isOptional)
+                    } else {
+                        operation = CallPrivateMethod(
+                            methodName: name, numArguments: arguments.count,
+                            isGuarded: callExpression.isOptional)
+                    }
+                    return emit(operation, withInputs: [object] + arguments).output
+                case .expression(let expr):
+                    let method = try compileExpression(expr)
+                    if isSpreading {
+                        return emit(
+                            CallComputedMethodWithSpread(
+                                numArguments: arguments.count, spreads: spreads,
+                                isGuarded: callExpression.isOptional),
+                            withInputs: [object, method] + arguments
+                        ).output
+                    } else {
+                        return emit(
+                            CallComputedMethod(
+                                numArguments: arguments.count, isGuarded: callExpression.isOptional),
+                            withInputs: [object, method] + arguments
+                        ).output
+                    }
+                }
+            } else if case .superMemberExpression(let superMemberExpression) = callExpression.callee
+                .expression
+            {
+                // super.foo(...)
+                guard !isSpreading else {
+                    throw CompilerError.unsupportedFeatureError(
+                        "Spread calls with super are not supported")
+                }
+                guard case .name(let methodName) = superMemberExpression.property else {
+                    throw CompilerError.invalidNodeError(
+                        "Super method calls must use a property name")
+                }
+                guard !callExpression.isOptional else {
+                    throw CompilerError.unsupportedFeatureError(
+                        "Optional chaining with super method calls is not supported")
+                }
+                return emit(
+                    CallSuperMethod(methodName: methodName, numArguments: arguments.count),
+                    withInputs: arguments
+                ).output
+                // Now check if it is a V8 intrinsic function
+            } else if case .v8IntrinsicIdentifier(let v8Intrinsic) = callExpression.callee
+                .expression
+            {
+                guard !isSpreading else {
+                    throw CompilerError.unsupportedFeatureError(
+                        "Not currently supporting spread calls to V8 intrinsics")
+                }
+                let argsString = Array(repeating: "%@", count: arguments.count).joined(
+                    separator: ", ")
+                return emit(
+                    Eval(
+                        "%\(v8Intrinsic.name)(\(argsString))", numArguments: arguments.count,
+                        hasOutput: true), withInputs: arguments
+                ).output
+                // Otherwise it's a regular function call
+            } else {
+                guard !callExpression.isOptional else {
+                    throw CompilerError.unsupportedFeatureError(
+                        "Not currently supporting optional chaining with function calls")
+                }
+                let callee = try compileExpression(callExpression.callee)
+                if isSpreading {
+                    return emit(
+                        CallFunctionWithSpread(
+                            numArguments: arguments.count, spreads: spreads, isGuarded: false),
+                        withInputs: [callee] + arguments
+                    ).output
+                } else {
+                    return emit(
+                        CallFunction(numArguments: arguments.count, isGuarded: false),
+                        withInputs: [callee] + arguments
+                    ).output
+                }
+            }
+
+        case .callSuperConstructor(let callSuperConstructor):
+            let (arguments, spreads) = try compileCallArguments(callSuperConstructor.arguments)
+            let isSpreading = spreads.contains(true)
+
+            if isSpreading {
+                throw CompilerError.unsupportedFeatureError(
+                    "Spread arguments are not supported in super constructor calls")
+            }
+            guard !callSuperConstructor.isOptional else {
+                throw CompilerError.unsupportedFeatureError(
+                    "Optional chaining is not supported in super constructor calls")
+            }
+            emit(CallSuperConstructor(numArguments: arguments.count), withInputs: arguments)
+            // In JS, the result of calling the super constructor is just |this|, but in FuzzIL the operation doesn't have an output (because |this| is always available anyway)
+            return lookupIdentifier("this")!  // we can force unwrap because |this| always exists in the context where |super| exists
+
+        case .newExpression(let newExpression):
+            let callee = try compileExpression(newExpression.callee)
+            let (arguments, spreads) = try compileCallArguments(newExpression.arguments)
+            let isSpreading = spreads.contains(true)
+            if isSpreading {
+                return emit(
+                    ConstructWithSpread(
+                        numArguments: arguments.count, spreads: spreads, isGuarded: false),
+                    withInputs: [callee] + arguments
+                ).output
+            } else {
+                return emit(
+                    Construct(numArguments: arguments.count, isGuarded: false),
+                    withInputs: [callee] + arguments
+                ).output
+            }
+
+        case .memberExpression(let memberExpression):
+            let object = try compileExpression(memberExpression.object)
+            guard let property = memberExpression.property else {
+                throw CompilerError.invalidNodeError("missing property in member expression")
+            }
+            switch property {
+            case .name(let name):
+                return emit(
+                    GetProperty(propertyName: name, isGuarded: memberExpression.isOptional),
+                    withInputs: [object]
+                ).output
+            case .privateName(let name):
+                return emit(
+                    GetPrivateProperty(propertyName: name, isGuarded: memberExpression.isOptional),
+                    withInputs: [object]
+                ).output
+            case .expression(let expr):
+                if case .numberLiteral(let literal) = expr.expression,
+                    let index = Int64(exactly: literal.value)
+                {
+                    return emit(
+                        GetElement(index: index, isGuarded: memberExpression.isOptional),
+                        withInputs: [object]
+                    ).output
+                } else {
+                    let property = try compileExpression(expr)
+                    return emit(
+                        GetComputedProperty(isGuarded: memberExpression.isOptional),
+                        withInputs: [object, property]
+                    ).output
+                }
+            }
+
+        case .superMemberExpression(let superMemberExpression):
+            guard superMemberExpression.isOptional == false else {
+                throw CompilerError.unsupportedFeatureError(
+                    "Optional chaining is not supported in super member expressions")
+            }
+            guard let property = superMemberExpression.property else {
+                throw CompilerError.invalidNodeError("Missing property in super member expression")
+            }
+
+            switch property {
+            case .name(let name):
+                return emit(GetSuperProperty(propertyName: name), withInputs: []).output
+
+            case .expression(let expr):
+                if case .numberLiteral(let literal) = expr.expression,
+                    Int64(exactly: literal.value) != nil
+                {
+                    throw CompilerError.unsupportedFeatureError(
+                        "GetElement is not supported in super member expressions")
+                } else {
+                    let compiledProperty = try compileExpression(expr)
+                    return emit(GetComputedSuperProperty(), withInputs: [compiledProperty]).output
+                }
+            }
+
+        case .unaryExpression(let unaryExpression):
+            if unaryExpression.operator == "typeof" {
+                let argument = try compileExpression(unaryExpression.argument)
+                return emit(TypeOf(), withInputs: [argument]).output
+            } else if unaryExpression.operator == "void" {
+                let argument = try compileExpression(unaryExpression.argument)
+                return emit(Void_(), withInputs: [argument]).output
+            } else if unaryExpression.operator == "delete" {
+                guard
+                    case .memberExpression(let memberExpression) = unaryExpression.argument
+                        .expression
+                else {
+                    throw CompilerError.invalidNodeError(
+                        "delete operator must be applied to a member expression")
+                }
+                if case .privateName = memberExpression.property {
+                    throw CompilerError.invalidNodeError(
+                        "Deleting private properties is a syntax error in JavaScript and not supported"
+                    )
+                }
+
+                let obj = try compileExpression(memberExpression.object)
+                // isGuarded is true if the member expression is optional (e.g., obj?.prop)
+                let isGuarded = memberExpression.isOptional
+
+                if !memberExpression.name.isEmpty {
+                    // Deleting a non-computed property (e.g., delete obj.prop)
+                    let propertyName = memberExpression.name
+                    let instr = emit(
+                        DeleteProperty(propertyName: propertyName, isGuarded: isGuarded),
+                        withInputs: [obj]
+                    )
+                    return instr.output
+                } else {
+                    // Deleting a computed property (e.g., delete obj[expr])
+                    let propertyExpression = memberExpression.expression
+                    let propertyExpr = propertyExpression.expression
+                    let property = try compileExpression(propertyExpression)
+
+                    if case .numberLiteral(let numberLiteral) = propertyExpr,
+                        let index = Int64(exactly: numberLiteral.value)
+                    {
+                        // Delete an element (e.g., delete arr[42])
+                        let instr = emit(
+                            DeleteElement(index: index, isGuarded: isGuarded),
+                            withInputs: [obj]
+                        )
+                        return instr.output
+                    } else {
+                        // Use DeleteComputedProperty for other computed properties (e.g., delete obj["key"])
+                        let instr = emit(
+                            DeleteComputedProperty(isGuarded: isGuarded),
+                            withInputs: [obj, property]
+                        )
+                        return instr.output
+                    }
+                }
+            } else {
+                guard let op = UnaryOperator(rawValue: unaryExpression.operator) else {
+                    throw CompilerError.invalidNodeError(
+                        "invalid unary operator: \(unaryExpression.operator)")
+                }
+                let argument = try compileExpression(unaryExpression.argument)
+                return emit(UnaryOperation(op), withInputs: [argument]).output
+            }
+
+        case .binaryExpression(let binaryExpression):
+            let lhs = try compileExpression(binaryExpression.lhs)
+            let rhs = try compileExpression(binaryExpression.rhs)
+            if let op = Comparator(rawValue: binaryExpression.operator) {
+                return emit(Compare(op), withInputs: [lhs, rhs]).output
+            } else if let op = BinaryOperator(rawValue: binaryExpression.operator) {
+                return emit(BinaryOperation(op), withInputs: [lhs, rhs]).output
+            } else if binaryExpression.operator == "in" {
+                return emit(TestIn(), withInputs: [lhs, rhs]).output
+            } else if binaryExpression.operator == "instanceof" {
+                return emit(TestInstanceOf(), withInputs: [lhs, rhs]).output
+            } else {
+                throw CompilerError.invalidNodeError(
+                    "invalid binary operator: \(binaryExpression.operator)")
+            }
+
+        case .updateExpression(let updateExpression):
+            // This is just a unary expression that modifies the argument (e.g. `++`)
+            let argument = try compileExpression(updateExpression.argument)
+            var stringOp = updateExpression.operator
+            if !updateExpression.isPrefix {
+                // The rawValue of postfix operators have an additional space at the end, which we make use of here.
+                stringOp += " "
+            }
+            guard let op = UnaryOperator(rawValue: stringOp) else {
+                throw CompilerError.invalidNodeError(
+                    "invalid unary operator: \(updateExpression.operator)")
+            }
+            return emit(UnaryOperation(op), withInputs: [argument]).output
+
+        case .yieldExpression(let yieldExpression):
+            let argument: Variable
+            if yieldExpression.hasArgument {
+                argument = try compileExpression(yieldExpression.argument)
+                return emit(Yield(hasArgument: true), withInputs: [argument]).output
+            } else {
+                return emit(Yield(hasArgument: false)).output
+            }
+
+        case .spreadElement:
+            fatalError("SpreadElement must be handled as part of their surrounding expression")
+
+        case .sequenceExpression(let sequenceExpression):
+            assert(!sequenceExpression.expressions.isEmpty)
+            return try sequenceExpression.expressions.map({ try compileExpression($0) }).last!
+
+        case .v8IntrinsicIdentifier:
+            fatalError(
+                "V8IntrinsicIdentifiers must be handled as part of their surrounding CallExpression"
+            )
+
+        case .awaitExpression(let awaitExpression):
+            if !contextAnalyzer.context.contains(.async) {
+                throw CompilerError.invalidNodeError(
+                    "`await` is currently only supported in async functions")
+            }
+            let argument = try compileExpression(awaitExpression.argument)
+            return emit(Await(), withInputs: [argument]).output
+
+        }
+    }
+
+    @discardableResult
+    private func emit(_ op: Operation, withInputs inputs: [Variable] = []) -> Instruction {
+        assert(op.numInputs == inputs.count)
+        let outputs = (0..<op.numOutputs).map { _ in nextFreeVariable() }
+        let innerOutputs = (0..<op.numInnerOutputs).map { _ in nextFreeVariable() }
+        let inouts = inputs + outputs + innerOutputs
+        let instr = Instruction(op, inouts: inouts)
+        contextAnalyzer.analyze(instr)
+        return code.append(instr)
+    }
+
+    private func enterNewScope(
+        labelToRegister: String? = nil, labelVariable: Variable? = nil, isLoop: Bool? = nil,
+        _ block: () throws -> Void
+    ) rethrows {
+        scopes.push([:])
+        labelsStack.push((label: labelToRegister, variable: labelVariable, isLoopLabel: isLoop))
+        try block()
+        labelsStack.pop()
+        scopes.pop()
+    }
+
+    private func lookupLabel(_ name: String) -> (Variable, Bool)? {
+        if let entry = labelsStack.elementsStartingAtTop().first(where: { $0.label == name }) {
+            return (entry.variable!, entry.isLoopLabel!)
+        }
+        return nil
+    }
+
+    private func map(_ identifier: String, to v: Variable) {
+        assert(scopes.top[identifier] == nil)
+        scopes.top[identifier] = v
+    }
+
+    private func remap(_ identifier: String, to v: Variable) {
+        assert(scopes.top[identifier] != nil)
+        scopes.top[identifier] = v
+    }
+
+    private func mapOrRemap(_ identifier: String, to v: Variable) {
+        scopes.top[identifier] = v
+    }
+
+    private func mapParameters(
+        _ parameters: Compiler_Protobuf_Parameters, to variables: ArraySlice<Variable>
+    ) throws {
+        var iter = variables.makeIterator()
+        for param in parameters.parameters {
+            switch param.id {
+            case .objectPattern(let obj):
+                // e.g. function foo({a, b}) {}
+                try mapDestructuringPattern(obj, iterator: &iter)
+            case .arrayPattern(let arr):
+                // e.g. function bar([x, y]) {}
+                try mapDestructuringPattern(arr, iterator: &iter)
+            case .name(let name):
+                map(name, to: iter.next()!)
+            case nil:
+                break
+            }
+        }
+    }
+
+    private func mapDestructuringTarget<Iter: IteratorProtocol>(
+        _ target: Compiler_Protobuf_LValue, iterator: inout Iter
+    ) throws where Iter.Element == Variable {
+        switch target.value {
+        case .destructuringPattern(let dp):
+            switch dp.pattern {
+            case .objectPattern(let obj):
+                try mapDestructuringPattern(obj, iterator: &iterator)
+            case .arrayPattern(let arr):
+                try mapDestructuringPattern(arr, iterator: &iterator)
+            case nil:
+                throw CompilerError.invalidASTError(
+                    "Invalid destructuring assignment target in parameter")
+            }
+        case .identifier(let id):
+            map(id.name, to: iterator.next()!)
+        default:
+            throw CompilerError.invalidASTError(
+                "Invalid destructuring assignment target in parameter")
+        }
+    }
+
+    private func mapDestructuringPattern<Iter: IteratorProtocol>(
+        _ pattern: Compiler_Protobuf_ObjectPattern, iterator: inout Iter
+    ) throws where Iter.Element == Variable {
+        for prop in pattern.properties {
+            try mapDestructuringTarget(prop.target, iterator: &iterator)
+        }
+        if pattern.hasRestTarget {
+            try mapDestructuringTarget(pattern.restTarget, iterator: &iterator)
+        }
+    }
+
+    private func mapDestructuringPattern<Iter: IteratorProtocol>(
+        _ pattern: Compiler_Protobuf_ArrayPattern, iterator: inout Iter
+    ) throws where Iter.Element == Variable {
+        for elem in pattern.elements {
+            guard elem.hasTarget else { continue }
+            try mapDestructuringTarget(elem.target, iterator: &iterator)
+        }
+        if pattern.hasRestTarget {
+            try mapDestructuringTarget(pattern.restTarget, iterator: &iterator)
+        }
+    }
+
+    private func compileDefaultValues(for parameters: Compiler_Protobuf_Parameters) throws
+        -> [Variable]
+    {
+        var defaultValues = [Variable]()
+        for param in parameters.parameters {
+            if param.hasDefaultValue {
+                defaultValues.append(try compileExpression(param.defaultValue))
+            }
+        }
+        return defaultValues
+    }
+
+    private func convertParameterDestructuringPattern(
+        _ pattern: Compiler_Protobuf_DestructuringPattern
+    ) throws -> DestructuringPattern {
+        switch pattern.pattern {
+        case .objectPattern(let objProto):
+            var properties = [DestructuringPattern.ObjectProperty]()
+            for prop in objProto.properties {
+                let key: DestructuringPattern.ObjectProperty.Key
+                if case .name(let s) = prop.key.body {
+                    key = .string(s)
+                } else if case .index(let i) = prop.key.body {
+                    // e.g. function foo({1: a}) {}
+                    key = .string(String(i))
+                } else {
+                    throw CompilerError.invalidASTError(
+                        "Computed keys not supported in parameter destructuring")
+                }
+
+                let target: DestructuringPattern.Target
+                switch prop.target.value {
+                case .destructuringPattern(let dp):
+                    target = .pattern(try convertParameterDestructuringPattern(dp))
+                case .identifier:
+                    target = .flatBinding
+                default:
+                    throw CompilerError.invalidASTError(
+                        "Invalid destructuring assignment target in parameter")
+                }
+
+                assert(
+                    !prop.hasDefaultValue,
+                    "Default values in parameter destructuring are not yet supported")
+                properties.append(
+                    DestructuringPattern.ObjectProperty(
+                        key: key, target: target, hasDefaultValue: false))
+            }
+            // FuzzIL operations only need to know if a rest target exists, not its string name.
+            // The string name mapping (e.g. "myRestParams" -> v3) is handled separately by `mapDestructuringPattern`.
+            return .object(
+                DestructuringPattern.ObjectPattern(
+                    properties: properties, hasRestElement: objProto.hasRestTarget))
+
+        case .arrayPattern(let arrProto):
+            var elements = [DestructuringPattern.ArrayElement]()
+            for elem in arrProto.elements {
+                guard elem.hasTarget else {
+                    elements.append(
+                        DestructuringPattern.ArrayElement(target: nil, hasDefaultValue: false))
+                    continue
+                }
+                let target: DestructuringPattern.Target
+                switch elem.target.value {
+                case .destructuringPattern(let dp):
+                    target = .pattern(try convertParameterDestructuringPattern(dp))
+                case .identifier:
+                    target = .flatBinding
+                default:
+                    throw CompilerError.invalidASTError(
+                        "Invalid destructuring assignment target in parameter")
+                }
+                assert(
+                    !elem.hasDefaultValue,
+                    "Default values in parameter destructuring are not yet supported")
+                elements.append(
+                    DestructuringPattern.ArrayElement(
+                        target: target, hasDefaultValue: false))
+            }
+            let restTarget: DestructuringPattern.Target?
+            if arrProto.hasRestTarget {
+                switch arrProto.restTarget.value {
+                case .destructuringPattern(let dp):
+                    restTarget = .pattern(try convertParameterDestructuringPattern(dp))
+                default:
+                    restTarget = .flatBinding
+                }
+            } else {
+                restTarget = nil
+            }
+            return .array(
+                DestructuringPattern.ArrayPattern(elements: elements, restTarget: restTarget))
+
+        case nil:
+            throw CompilerError.invalidASTError("Missing pattern")
+        }
+    }
+
+    private func convertParameters(_ parameters: Compiler_Protobuf_Parameters) throws -> Parameters
+    {
+        let defaultParameterIndices = parameters.parameters.enumerated()
+            .filter { $0.element.hasDefaultValue }
+            .map { $0.offset }
+
+        var destructuringParameters = [Int: DestructuringPattern]()
+        for (i, param) in parameters.parameters.enumerated() {
+            switch param.id {
+            case .objectPattern(let obj):
+                let dp = Compiler_Protobuf_DestructuringPattern.with { $0.objectPattern = obj }
+                destructuringParameters[i] = try convertParameterDestructuringPattern(dp)
+            case .arrayPattern(let arr):
+                let dp = Compiler_Protobuf_DestructuringPattern.with { $0.arrayPattern = arr }
+                destructuringParameters[i] = try convertParameterDestructuringPattern(dp)
+            default:
+                break
+            }
+        }
+
+        return Parameters(
+            count: parameters.parameters.count, hasRestParameter: parameters.hasRestElement_p,
+            defaultParameterIndices: defaultParameterIndices,
+            destructuringParameters: destructuringParameters)
+    }
+
+    /// Convenience accessor for the currently active scope.
+    private var currentScope: [String: Variable] {
+        return scopes.top
+    }
+
+    /// Lookup the FuzzIL variable currently mapped to the given identifier, if any.
+    private func lookupIdentifier(_ name: String) -> Variable? {
+        for scope in scopes.elementsStartingAtTop() {
+            if let v = scope[name] {
+                return v
+            }
+        }
+        return nil
+    }
+
+    private func compileCallArguments(_ args: [ExpressionNode]) throws -> ([Variable], [Bool]) {
+        var variables = [Variable]()
+        var spreads = [Bool]()
+
+        for expr in args {
+            if case .spreadElement(let spreadElement) = expr.expression {
+                variables.append(try compileExpression(spreadElement.argument))
+                spreads.append(true)
+            } else {
+                variables.append(try compileExpression(expr))
+                spreads.append(false)
+            }
+        }
+
+        assert(variables.count == spreads.count)
+        return (variables, spreads)
+    }
+
+    private func reset() {
+        // TODO(marja): Make JavaScriptCompiler understand bundles.
+        code = Code(isBundle: false)
+        scopes.removeAll()
+        labelsStack.removeAll()
+        nextVariable = 0
+    }
+
+    private func compileMemberExpressionTarget(
+        _ memExpr: Compiler_Protobuf_MemberExpression,
+        isReassignment: Bool, inputs: inout [Variable]
+    ) throws -> DestructuringPattern.Target {
+        if !isReassignment {
+            throw CompilerError.invalidASTError(
+                "Member expression destructuring must be reassignment")
+        }
+        inputs.append(try compileExpression(memExpr.object))
+        switch memExpr.property {
+        case .name(let s):
+            return .property(s)
+        case .privateName(let s):
+            return .privateProperty(s)
+        case .expression(let expr):
+            if case .numberLiteral(let literal) = expr.expression,
+                let index = Int64(exactly: literal.value)
+            {
+                return .element(index)
+            } else {
+                inputs.append(try compileExpression(expr))
+                return .computedProperty
+            }
+        case nil:
+            throw CompilerError.invalidASTError("Missing property in member expression")
+        }
+    }
+
+    private func compileSuperMemberExpressionTarget(
+        _ memExpr: Compiler_Protobuf_SuperMemberExpression,
+        isReassignment: Bool, inputs: inout [Variable]
+    ) throws -> DestructuringPattern.Target {
+        if !isReassignment {
+            throw CompilerError.invalidASTError(
+                "Member expression destructuring must be reassignment")
+        }
+        switch memExpr.property {
+        case .name(let s): return .superProperty(s)
+        case .expression(let expr):
+            if case .numberLiteral(let literal) = expr.expression,
+                let index = Int64(exactly: literal.value)
+            {
+                return .superElement(index)
+            } else {
+                inputs.append(try compileExpression(expr))
+                return .superComputedProperty
+            }
+        case nil:
+            throw CompilerError.invalidASTError("Missing property in super member expression")
+        }
+    }
+
+    private func compileDestructuringPattern(
+        _ pattern: Compiler_Protobuf_DestructuringPattern, inputs: inout [Variable],
+        outputs: inout [String], isReassignment: Bool
+    ) throws -> DestructuringPattern {
+        switch pattern.pattern {
+        case .objectPattern(let objProto):
+            return .object(
+                try compileObjectPattern(
+                    objProto, inputs: &inputs, outputs: &outputs, isReassignment: isReassignment))
+        case .arrayPattern(let arrProto):
+            return .array(
+                try compileArrayPattern(
+                    arrProto, inputs: &inputs, outputs: &outputs, isReassignment: isReassignment))
+        case nil:
+            throw CompilerError.invalidASTError("Missing pattern in DestructuringPattern")
+        }
+    }
+
+    private func compileObjectPattern(
+        _ objProto: Compiler_Protobuf_ObjectPattern, inputs: inout [Variable],
+        outputs: inout [String], isReassignment: Bool
+    ) throws -> DestructuringPattern.ObjectPattern {
+        var properties = [DestructuringPattern.ObjectProperty]()
+        for propProto in objProto.properties {
+            let key: DestructuringPattern.ObjectProperty.Key
+            switch propProto.key.body {
+            case .name(let s):
+                key = .string(s)
+            case .index(let i):
+                key = .string(String(i))
+            case .expression(let exprProto):
+                let exprVar = try compileExpression(exprProto)
+                key = .computed
+                inputs.append(exprVar)
+            default:
+                throw CompilerError.invalidASTError("Invalid key in ObjectPatternProperty")
+            }
+
+            let target: DestructuringPattern.Target
+            switch propProto.target.value {
+            case .identifier(let identifier):
+                target = .flatBinding
+                if isReassignment {
+                    inputs.append(findOrCreateVariable(identifier.name))
+                } else {
+                    outputs.append(identifier.name)
+                }
+            case .destructuringPattern(let p):
+                target = .pattern(
+                    try compileDestructuringPattern(
+                        p, inputs: &inputs, outputs: &outputs, isReassignment: isReassignment))
+            case .memberExpression(let memExpr):
+                target = try compileMemberExpressionTarget(
+                    memExpr, isReassignment: isReassignment, inputs: &inputs)
+            case .superMemberExpression(let memExpr):
+                target = try compileSuperMemberExpressionTarget(
+                    memExpr, isReassignment: isReassignment, inputs: &inputs)
+            case nil:
+                // Implicit shorthand (e.g. {x}) means key is a string and target is the same string
+                if case .string(let s) = key {
+                    target = .flatBinding
+                    if isReassignment {
+                        inputs.append(findOrCreateVariable(s))
+                    } else {
+                        outputs.append(s)
+                    }
+                } else {
+                    throw CompilerError.invalidASTError(
+                        "Missing target in ObjectPatternProperty without string key")
+                }
+            }
+
+            var hasDefaultValue = false
+            if propProto.hasDefaultValue {
+                // TODO(rherouart): we should not emit FuzzIL Code unless default is called, otherwise
+                // `let {a = default_with_side_effect()} = foo;`
+                // may behave differently in original and re-lifted code otherwise.
+                let defaultVar = try compileExpression(propProto.defaultValue)
+                hasDefaultValue = true
+                inputs.append(defaultVar)
+            }
+
+            properties.append(
+                DestructuringPattern.ObjectProperty(
+                    key: key, target: target, hasDefaultValue: hasDefaultValue))
+        }
+
+        if objProto.hasRestTarget {
+            switch objProto.restTarget.value {
+            case .identifier(let identifier):
+                if isReassignment {
+                    inputs.append(findOrCreateVariable(identifier.name))
+                } else {
+                    outputs.append(identifier.name)
+                }
+            default:
+                throw CompilerError.unsupportedFeatureError(
+                    "Destructuring object rest to non-identifier is not yet supported in FuzzIL")
+            }
+        }
+        return DestructuringPattern.ObjectPattern(
+            properties: properties, hasRestElement: objProto.hasRestTarget)
+    }
+
+    private func compileArrayPattern(
+        _ arrProto: Compiler_Protobuf_ArrayPattern, inputs: inout [Variable],
+        outputs: inout [String], isReassignment: Bool
+    ) throws -> DestructuringPattern.ArrayPattern {
+        var elements = [DestructuringPattern.ArrayElement]()
+        for elemProto in arrProto.elements {
+            let target: DestructuringPattern.Target?
+            switch elemProto.target.value {
+            case .identifier(let identifier):
+                target = .flatBinding
+                if isReassignment {
+                    inputs.append(findOrCreateVariable(identifier.name))
+                } else {
+                    outputs.append(identifier.name)
+                }
+            case .destructuringPattern(let p):
+                target = .pattern(
+                    try compileDestructuringPattern(
+                        p, inputs: &inputs, outputs: &outputs, isReassignment: isReassignment))
+            case .memberExpression(let memExpr):
+                target = try compileMemberExpressionTarget(
+                    memExpr, isReassignment: isReassignment, inputs: &inputs)
+            case .superMemberExpression(let memExpr):
+                target = try compileSuperMemberExpressionTarget(
+                    memExpr, isReassignment: isReassignment, inputs: &inputs)
+            case nil:
+                target = nil
+            }
+
+            var hasDefaultValue = false
+            if elemProto.hasDefaultValue {
+                let defaultVar = try compileExpression(elemProto.defaultValue)
+                hasDefaultValue = true
+                inputs.append(defaultVar)
+            }
+
+            elements.append(
+                DestructuringPattern.ArrayElement(
+                    target: target, hasDefaultValue: hasDefaultValue))
+        }
+
+        let restTarget: DestructuringPattern.Target?
+        switch arrProto.restTarget.value {
+        case .identifier(let identifier):
+            restTarget = .flatBinding
+            if isReassignment {
+                inputs.append(findOrCreateVariable(identifier.name))
+            } else {
+                outputs.append(identifier.name)
+            }
+        case .destructuringPattern(let p):
+            restTarget = .pattern(
+                try compileDestructuringPattern(
+                    p, inputs: &inputs, outputs: &outputs, isReassignment: isReassignment))
+        case .memberExpression(let memExpr):
+            restTarget = try compileMemberExpressionTarget(
+                memExpr, isReassignment: isReassignment, inputs: &inputs)
+        case .superMemberExpression(let memExpr):
+            restTarget = try compileSuperMemberExpressionTarget(
+                memExpr, isReassignment: isReassignment, inputs: &inputs)
+        case nil:
+            restTarget = .none
+        }
+
+        return DestructuringPattern.ArrayPattern(elements: elements, restTarget: restTarget)
+    }
+}

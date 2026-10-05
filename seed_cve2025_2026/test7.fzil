@@ -1,0 +1,54 @@
+v0 <- BeginPlainFunction -> 
+    v1 <- BeginPlainFunction -> v2, v3
+        v4 <- GetElement v3, '0'
+        v5 <- CreateNamedVariable 'v4', 'var', v4
+        v6 <- GetElement v2, '0'
+        v7 <- CreateNamedVariable 'v5', 'var', v6
+        v8 <- CreateNamedVariable 'Array', 'none'
+        v9 <- GetProperty v8, 'prototype'
+        v10 <- GetProperty v9, 'indexOf'
+        v11 <- CallMethod v10, 'call', [v3]
+    EndPlainFunction
+    v12 <- Eval '%PrepareFunctionForOptimization(%@)', [v1]
+    v13 <- CreateNamedVariable 'Array', 'none'
+    v14 <- LoadInteger '1'
+    v15 <- Construct v13, [v14]
+    v16 <- CreateNamedVariable 'holey', 'const', v15
+    v17 <- LoadString 'tagged'
+    SetElement v16, '0', v17
+    v18 <- LoadInteger '1'
+    v19 <- CreateArray [v18]
+    v20 <- CallFunction v1, [v16, v19]
+    v21 <- LoadInteger '1'
+    v22 <- Construct v13, [v21]
+    v23 <- CreateNamedVariable 'holey_double', 'const', v22
+    v24 <- LoadFloat '0.1'
+    SetElement v23, '0', v24
+    v25 <- Eval '%OptimizeFunctionOnNextCall(%@)', [v1]
+    v26 <- CallFunction v1, [v23, v23]
+EndPlainFunction
+v27 <- CallFunction v0, []
+v28 <- CallFunction v0, []
+
+
+function main() {
+    function f0(a2, a3) {
+        var v4 = a3[0];
+        var v5 = a2[0];
+        Array.prototype.indexOf.call(a3);
+    }
+    const v12 = %PrepareFunctionForOptimization(f0);
+    const v15 = new Array(1);
+    const holey = v15;
+    holey[0] = "tagged";
+    f0(holey, [1]);
+    const v22 = new Array(1);
+    const holey_double = v22;
+    holey_double[0] = 0.1;
+    const v25 = %OptimizeFunctionOnNextCall(f0);
+    f0(holey_double, holey_double);
+}
+main();
+main();
+
+FuzzIL program written to /v8/fuzzilli/seed_cve2025_2026/test7.fzil

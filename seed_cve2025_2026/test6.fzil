@@ -1,0 +1,13 @@
+v0 <- LoadInteger '2'
+v1 <- LoadInteger '16'
+v2 <- BinaryOperation v0, '**', v1
+v3 <- LoadInteger '10'
+v4 <- BinaryOperation v2, '-', v3
+v5 <- CreateNamedVariable 'Array', 'none'
+v6 <- CallFunction v5, [v4]
+v7 <- CreateNamedVariable 'a', 'var', v6
+
+
+var a = Array((2 ** 16) - 10);
+
+FuzzIL program written to /v8/fuzzilli/seed_cve2025_2026/test6.fzil

@@ -1,0 +1,67 @@
+BeginForLoopInitializer
+    v0 <- LoadInteger '100'
+BeginForLoopCondition -> v1
+BeginForLoopAfterthought v1 -> v2
+    v3 <- UnaryOperation '--', v2
+BeginForLoopBody -> v4, v5
+EndForLoop
+v6 <- BeginPlainFunction -> v7
+    BeginForLoopInitializer
+        v8 <- LoadInteger '0'
+    BeginForLoopCondition -> v9
+        v10 <- LoadInteger '5'
+        v11 <- Compare v9, '<', v10
+    BeginForLoopAfterthought v11 -> v12
+        v13 <- UnaryOperation v12, '++'
+    BeginForLoopBody -> v14, v15
+    EndForLoop
+    v16 <- CallMethod v7, 'slice', []
+    v17 <- BeginPlainFunction -> v18
+        v19 <- CallMethod v18, 'forEach', [v6]
+        Return v18
+    EndPlainFunction
+    v20 <- LoadUndefined
+    v21 <- LoadFloat '1.1'
+    v22 <- CreateArray [v20, v21]
+    v23 <- CallFunction v17, [v22]
+    Return v6
+EndPlainFunction
+BeginForLoopInitializer
+    v24 <- LoadInteger '0'
+BeginForLoopCondition -> v25
+    v26 <- LoadInteger '25'
+    v27 <- Compare v25, '<', v26
+BeginForLoopAfterthought v27 -> v28
+    v29 <- UnaryOperation v28, '++'
+BeginForLoopBody -> v30, v31
+    v32 <- CreateArray [v6]
+    v33 <- CreateNamedVariable 'v17', 'const', v32
+    BeginTry
+        v34 <- CallFunction v6, [v33]
+    BeginCatch -> v35
+    EndTryCatch
+EndForLoop
+
+
+for (let i1 = 100; i1; --i1) {
+}
+function f5(a7) {
+    for (let i9 = 0; i9 < 5; i9++) {
+    }
+    a7.slice();
+    function f9(a18) {
+        a18.forEach(f5);
+        return a18;
+    }
+    f9([,1.1]);
+    return f5;
+}
+for (let i25 = 0; i25 < 25; i25++) {
+    const v17 = [f5];
+    try {
+        f5(v17);
+    } catch(e35) {
+    }
+}
+
+FuzzIL program written to /v8/fuzzilli/seed_cve2025_2026/test13.fzil

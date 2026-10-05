@@ -1,0 +1,50 @@
+v0 <- LoadInteger '1'
+v1 <- LoadUndefined
+v2 <- LoadFloat '1.1'
+v3 <- CreateArray [v0, v1, v1, v1, v1, v2]
+v4 <- CreateNamedVariable 'arr', 'const', v3
+v5 <- BeginPlainFunction -> 
+    BeginForLoopInitializer
+        v6 <- LoadInteger '0'
+    BeginForLoopCondition -> v7
+        v8 <- LoadInteger '5'
+        v9 <- Compare v7, '<', v8
+    BeginForLoopAfterthought v9 -> v10
+        v11 <- UnaryOperation v10, '++'
+    BeginForLoopBody -> v12, v13
+        v14 <- GetComputedProperty v4, v12
+        v15 <- CreateNamedVariable 'ele', 'const', v14
+        v16 <- CreateNamedVariable 'Array', 'none'
+        v17 <- CallFunction v16, [v15, v12]
+        v18 <- CreateNamedVariable 'arr2', 'const', v17
+        v19 <- BeginPlainFunction -> 
+            v20 <- CallMethod v18, 'join', []
+            SetProperty v4, '__proto__', v15
+        EndPlainFunction
+        v21 <- CallFunction v19, []
+    EndForLoop
+EndPlainFunction
+v22 <- Eval '%PrepareFunctionForOptimization(%@)', [v5]
+v23 <- CallFunction v5, []
+v24 <- Eval '%OptimizeMaglevOnNextCall(%@)', [v5]
+v25 <- CallFunction v5, []
+
+
+const arr = [1,,,,,1.1];
+function opt_me() {
+    for (let i7 = 0; i7 < 5; i7++) {
+        const ele = arr[i7];
+        const arr2 = Array(ele, i7);
+        function inner() {
+            arr2.join();
+            arr.__proto__ = ele;
+        }
+        inner();
+    }
+}
+const v22 = %PrepareFunctionForOptimization(opt_me);
+opt_me();
+const v24 = %OptimizeMaglevOnNextCall(opt_me);
+opt_me();
+
+FuzzIL program written to /v8/fuzzilli/seed_cve2025_2026/test11.fzil

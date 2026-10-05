@@ -1,0 +1,62 @@
+v0 <- BeginClassDefinition (decl)
+EndClassDefinition
+BeginObjectLiteral
+    BeginObjectLiteralMethod `n` -> v1
+        BeginTry
+            v2 <- CallMethod v1, 'n', []
+        BeginCatch -> v3
+        EndTryCatch
+        v4 <- BeginClassDefinition (decl)
+            BeginClassConstructor -> v5
+                v6 <- BeginClassDefinition (decl) v0
+                    BeginClassConstructor -> v7
+                    EndClassConstructor
+                    ClassAddProperty 'a'
+                    BeginClassStaticInitializer -> v8
+                    EndClassStaticInitializer
+                    ClassAddProperty 'b'
+                    BeginClassStaticInitializer -> v9
+                        v10 <- LoadInteger '0'
+                        v11 <- CreateNamedVariable 'x', 'let', v10
+                    EndClassStaticInitializer
+                EndClassDefinition
+            EndClassConstructor
+        EndClassDefinition
+        v12 <- Construct v4, []
+    EndObjectLiteralMethod
+v13 <- EndObjectLiteral
+v14 <- CreateNamedVariable 'v1', 'const', v13
+v15 <- CallMethod v14, 'n', []
+v16 <- CreateNamedVariable 'res', 'let', v15
+
+
+class C0 {
+}
+const v13 = {
+    n() {
+        try {
+            this.n();
+        } catch(e3) {
+        }
+        class C4 {
+            constructor() {
+                class C6 extends C0 {
+                    constructor() {
+                    }
+                    a;
+                    static {
+                    }
+                    b;
+                    static {
+                        let x = 0;
+                    }
+                }
+            }
+        }
+        new C4();
+    },
+};
+const v1 = v13;
+let res = v1.n();
+
+FuzzIL program written to /v8/fuzzilli/seed_cve2025_2026/test15.fzil

@@ -1,0 +1,36 @@
+v0 <- CreateNamedVariable 'ArrayBuffer', 'none'
+v1 <- LoadInteger '64'
+v2 <- Construct v0, [v1]
+v3 <- CreateNamedVariable 'ab', 'const', v2
+v4 <- CreateNamedVariable 'Uint8Array', 'none'
+v5 <- Construct v4, [v3]
+v6 <- CreateNamedVariable 'typedArray', 'let', v5
+BeginObjectLiteral
+    BeginObjectLiteralMethod `valueOf` -> v7
+        v8 <- CallMethod v3, 'transfer', []
+        v9 <- LoadInteger '3'
+        Return v9
+    EndObjectLiteralMethod
+v10 <- EndObjectLiteral
+v11 <- CreateNamedVariable 'evil_obj', 'const', v10
+v12 <- CreateNamedVariable 'DataView', 'none'
+v13 <- LoadInteger '0'
+v14 <- Construct v12, [v3, v13, v11]
+v15 <- CreateNamedVariable 'view', 'let', v14
+
+
+const v2 = new ArrayBuffer(64);
+const ab = v2;
+const v5 = new Uint8Array(ab);
+let typedArray = v5;
+const v10 = {
+    valueOf() {
+        ab.transfer();
+        return 3;
+    },
+};
+const evil_obj = v10;
+const v14 = new DataView(ab, 0, evil_obj);
+let view = v14;
+
+FuzzIL program written to /v8/fuzzilli/seed_cve2025_2026/test19.fzil

@@ -1,0 +1,79 @@
+v0 <- LoadInteger '0'
+v1 <- CreateNamedVariable 'use', 'let', v0
+v2 <- LoadInteger '0'
+v3 <- CreateNamedVariable 'v', 'let', v2
+v4 <- BeginGeneratorFunction -> v5, v6
+    BeginIf v5 -> v7
+        v8 <- Eval '%OptimizeOsr()', []
+    EndIf
+    BeginForLoopInitializer
+        v9 <- LoadInteger '0'
+    BeginForLoopCondition -> v10
+        v11 <- LoadInteger '1'
+        v12 <- Compare v10, '<', v11
+    BeginForLoopAfterthought v12 -> v13
+        v14 <- UnaryOperation v13, '++'
+    BeginForLoopBody -> v15, v16
+    EndForLoop
+    BeginForLoopInitializer
+        v17 <- LoadInteger '0'
+    BeginForLoopCondition -> v18
+        v19 <- LoadInteger '1'
+        v20 <- Compare v18, '<', v19
+    BeginForLoopAfterthought v20 -> v21
+        v22 <- UnaryOperation v21, '++'
+    BeginForLoopBody -> v23, v24
+        v25 <- LoadInteger '1'
+        v26 <- BinaryOperation v6, '||', v25
+        v27 <- CreateNamedVariable 'tmp', 'const', v26
+        v28 <- LoadInteger '4'
+        v29 <- BinaryOperation v27, '%', v28
+        Reassign v1, v29
+        Reassign v3, v27
+        v30 <- LoadInteger '1'
+        v31 <- Yield v30
+    EndForLoop
+EndGeneratorFunction
+v32 <- Eval '%PrepareFunctionForOptimization(%@)', [v4]
+v33 <- LoadBoolean 'false'
+v34 <- LoadInteger '123'
+v35 <- CallFunction v4, [v33, v34]
+v36 <- CallMethod v35, 'next', []
+v37 <- CreateNamedVariable 'print', 'none'
+v38 <- CallFunction v37, [v3]
+v39 <- LoadBoolean 'false'
+v40 <- LoadInteger '123'
+v41 <- CallFunction v4, [v39, v40]
+v42 <- CallMethod v41, 'next', []
+v43 <- CallFunction v37, [v3]
+v44 <- LoadBoolean 'true'
+v45 <- LoadInteger '123'
+v46 <- CallFunction v4, [v44, v45]
+v47 <- CallMethod v46, 'next', []
+v48 <- CallFunction v37, [v3]
+
+
+let use = 0;
+let v = 0;
+function* opt_me(a5, a6) {
+    if (a5) {
+        const v8 = %OptimizeOsr();
+    }
+    for (let i10 = 0; i10 < 1; i10++) {
+    }
+    for (let i18 = 0; i18 < 1; i18++) {
+        const tmp = a6 || 1;
+        use = tmp % 4;
+        v = tmp;
+        yield 1;
+    }
+}
+const v32 = %PrepareFunctionForOptimization(opt_me);
+opt_me(false, 123).next();
+print(v);
+opt_me(false, 123).next();
+print(v);
+opt_me(true, 123).next();
+print(v);
+
+FuzzIL program written to /v8/fuzzilli/seed_cve2025_2026/test4.fzil

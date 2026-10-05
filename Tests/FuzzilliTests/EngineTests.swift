@@ -1,0 +1,151 @@
+// Copyright 2025 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+import Foundation
+import Testing
+
+@testable import Fuzzilli
+
+struct EngineTests {
+    @Test
+    func testPostProcessorOnGenerativeEngine() throws {
+        class MockPostProcessor: FuzzingPostProcessor {
+            var callCount = 0
+            func process(_ program: Program, for fuzzer: Fuzzer) -> Program {
+                callCount += 1
+                return program
+            }
+        }
+        let mockPostProcessor = MockPostProcessor()
+
+        let engine = MutationEngine(numConsecutiveMutations: 1)
+        engine.registerPostProcessor(mockPostProcessor)
+        let q = DispatchQueue(label: "fuzzerQueue")
+        let fuzzer = makeMockFuzzer(engine: engine, queue: q)
+        fuzzer.sync {
+            #expect(fuzzer.corpusGenerationEngine.postProcessor != nil)
+            #expect(mockPostProcessor.callCount == 0)
+            fuzzer.start(runUntil: .iterationsPerformed(3))
+        }
+        // Synchronize on the queue 2 times, so that each time at least one new
+        // fuzzOne() is executed on the DispatchQueue in that time.
+        // This should work consistently as the DispatchQueue is not marked
+        // with DispatchQueue.Attributes.concurrent, so each time one of the
+        // que.sync {} is executed, a fuzzOne() was executed as well.
+        fuzzer.sync {
+            #expect(mockPostProcessor.callCount == 2)
+        }
+        fuzzer.sync {
+            #expect(mockPostProcessor.callCount == 3)
+        }
+        // No more tasks are queued.
+        fuzzer.sync {
+            #expect(mockPostProcessor.callCount == 3)
+            #expect(fuzzer.isStopped)
+        }
+    }
+
+    // Test that certain usages of "arguments" are rejected by the Dumpling
+    // post processor.
+    @Test
+    func testDumplingPostProcessor() {
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let processor = DumplingFuzzingPostProcessor()
+
+            let rejectedCases: [(ProgramBuilder) -> Void] = [
+                { b in
+                    let f = b.buildPlainFunction(with: .parameters(n: 0)) { _ in }
+                    b.getProperty("arguments", of: f)
+                },
+                { b in
+                    let f = b.buildPlainFunction(with: .parameters(n: 0)) { _ in }
+                    let i = b.loadInt(0)
+                    b.setProperty("arguments", of: f, to: i)
+                },
+                { b in
+                    let f = b.buildPlainFunction(with: .parameters(n: 0)) { _ in }
+                    let i = b.loadInt(0)
+                    b.updateProperty("arguments", of: f, with: i, using: BinaryOperator.Add)
+                },
+                { b in
+                    let f = b.buildPlainFunction(with: .parameters(n: 0)) { _ in }
+                    b.deleteProperty("arguments", of: f)
+                },
+                { b in
+                    let f = b.buildPlainFunction(with: .parameters(n: 0)) { _ in }
+                    let a = b.loadString("arguments")
+                    b.getComputedProperty(a, of: f)
+                },
+            ]
+
+            for (i, rejectedCase) in rejectedCases.enumerated() {
+                let b = fuzzer.makeBuilder()
+                rejectedCase(b)
+                let program = b.finalize()
+                #expect(throws: (any Error).self, "test case \(i)") {
+                    try processor.process(program, for: fuzzer)
+                }
+            }
+
+            for acceptedCase: (ProgramBuilder) -> Void in [
+                { b in
+                    let f = b.buildPlainFunction(with: .parameters(n: 0)) { _ in }
+                    b.getProperty("not_arguments", of: f)
+                },
+                { b in
+                    let f = b.buildPlainFunction(with: .parameters(n: 0)) { _ in }
+                    let a = b.loadString("not_arguments")
+                    b.getComputedProperty(a, of: f)
+                },
+            ] {
+
+                let b = fuzzer.makeBuilder()
+                acceptedCase(b)
+                let program = b.finalize()
+                _ = try! processor.process(program, for: fuzzer)
+            }
+        }
+    }
+
+    @Test
+    func testHybridEngineBundleGeneration() {
+        let config = Configuration(logLevel: .error, generateBundle: true)
+        let engine = HybridEngine(numConsecutiveMutations: 0)
+
+        let template = ProgramTemplate("TestTemplate") { b in
+            let val = b.loadInt(42)
+            b.doPrint(val)
+        }
+
+        let q = DispatchQueue(label: "fuzzerQueue")
+        let fuzzer = makeMockFuzzer(
+            config: config,
+            engine: engine,
+            queue: q
+        )
+
+        fuzzer.sync {
+            let program = engine.generateTemplateProgram(template: template)
+
+            let liftedCode = fuzzer.lifter.lift(program)
+            let expected = """
+                // JS_BUNDLE_SCRIPT
+                fuzzilli('FUZZILLI_PRINT', 42);
+
+                """
+            #expect(liftedCode == expected)
+        }
+    }
+}

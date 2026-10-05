@@ -1,0 +1,72 @@
+v0 <- Eval '%GetFunctionForCurrentFrame()', []
+v1 <- CreateNamedVariable 'topLevel', 'const', v0
+v2 <- Eval '%PrepareFunctionForOptimization(%@)', [v1]
+v3 <- BeginPlainFunction -> 
+    v4 <- LoadArguments
+    v5 <- GetProperty v4, 'length'
+    v6 <- LoadInteger '1'
+    v7 <- BinaryOperation v5, '+', v6
+    Return v7
+EndPlainFunction
+v8 <- LoadInteger '40000'
+v9 <- CreateNamedVariable 'num_args', 'var', v8
+v10 <- LoadString ''
+v11 <- CreateNamedVariable 'argsList', 'var', v10
+BeginForLoopInitializer
+    v12 <- LoadInteger '0'
+BeginForLoopCondition -> v13
+    v14 <- Compare v13, '<', v9
+BeginForLoopAfterthought v14 -> v15
+    v16 <- UnaryOperation v15, '++'
+BeginForLoopBody -> v17, v18
+    v19 <- LoadString 'a'
+    v20 <- BinaryOperation v19, '+', v17
+    v21 <- LoadString ','
+    v22 <- BinaryOperation v20, '+', v21
+    Update v11, '+', v22
+EndForLoop
+v23 <- LoadInteger '0'
+v24 <- LoadInteger '1'
+v25 <- UnaryOperation '-', v24
+v26 <- CallMethod v11, 'slice', [v23, v25]
+Reassign v11, v26
+v27 <- LoadString 'return arguments.length + 1;'
+v28 <- CreateNamedVariable 'body', 'var', v27
+v29 <- CreateNamedVariable 'Function', 'none'
+v30 <- Construct v29, [v11, v28]
+v31 <- CreateNamedVariable 'bigArgFunc', 'var', v30
+BeginForLoopInitializer
+    v32 <- LoadInteger '0'
+BeginForLoopCondition -> v33
+    v34 <- LoadInteger '2'
+    v35 <- Compare v33, '<', v34
+BeginForLoopAfterthought v35 -> v36
+    v37 <- UnaryOperation v36, '++'
+BeginForLoopBody -> v38, v39
+    v40 <- LoadInteger '0'
+    v41 <- CallFunction v31, [v40]
+    v42 <- Eval '%OptimizeOsr()', []
+EndForLoop
+
+
+const v0 = %GetFunctionForCurrentFrame();
+const topLevel = v0;
+const v2 = %PrepareFunctionForOptimization(topLevel);
+function g() {
+    return arguments.length + 1;
+}
+var num_args = 40000;
+var argsList = "";
+for (let i13 = 0; i13 < num_args; i13++) {
+    argsList += ("a" + i13) + ",";
+}
+argsList = argsList.slice(0, -1);
+var body = "return arguments.length + 1;";
+const v30 = new Function(argsList, body);
+var bigArgFunc = v30;
+for (let i33 = 0; i33 < 2; i33++) {
+    bigArgFunc(0);
+    const v42 = %OptimizeOsr();
+}
+
+FuzzIL program written to /v8/fuzzilli/seed_cve2025_2026/test8.fzil

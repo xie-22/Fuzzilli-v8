@@ -1,0 +1,40 @@
+v0 <- LoadString 'AA'
+v1 <- CreateNamedVariable 'key', 'let', v0
+v2 <- LoadInteger '2'
+v3 <- CreateNamedVariable 'value', 'let', v2
+v4 <- CreateNamedVariable 'Function', 'none'
+v5 <- BeginClassDefinition (decl) v4
+    ClassAddComputedProperty v1 v3
+EndClassDefinition
+BeginForLoopInitializer
+    v6 <- LoadInteger '0'
+BeginForLoopCondition -> v7
+    v8 <- LoadInteger '5'
+    v9 <- Compare v7, '<', v8
+BeginForLoopAfterthought v9 -> v10
+    v11 <- UnaryOperation v10, '++'
+BeginForLoopBody -> v12, v13
+    v14 <- BeginPlainFunction -> 
+        v15 <- UnaryOperation '+', v14
+        Reassign v3, v15
+    EndPlainFunction
+    v16 <- LoadString ''use strict''
+    v17 <- Construct v5, [v16]
+    v18 <- CallFunction v14, []
+EndForLoop
+
+
+let key = "AA";
+let value = 2;
+class C5 extends Function {
+    [key] = value;
+}
+for (let i7 = 0; i7 < 5; i7++) {
+    function f() {
+        value = +f;
+    }
+    new C5("'use strict'");
+    f();
+}
+
+FuzzIL program written to /v8/fuzzilli/seed_cve2025_2026/test20.fzil

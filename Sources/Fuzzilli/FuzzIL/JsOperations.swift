@@ -1,0 +1,3646 @@
+// Copyright 2019 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+/// A JavaScript operation in the FuzzIL language.
+class JsOperation: Operation {
+    override init(
+        numInputs: Int = 0, numOutputs: Int = 0, numInnerOutputs: Int = 0,
+        firstVariadicInput: Int = -1, attributes: Attributes = [],
+        requiredContext: Context = .javascript, contextOpened: Context = .empty
+    ) {
+        super.init(
+            numInputs: numInputs, numOutputs: numOutputs, numInnerOutputs: numInnerOutputs,
+            firstVariadicInput: firstVariadicInput, attributes: attributes,
+            requiredContext: requiredContext, contextOpened: contextOpened)
+    }
+}
+
+/// A JavaScript operation that can guard against runtime exceptions.
+///
+/// This can be used when it cannot statically be guaranteed that an
+/// operation will not cause a runtime exception. For example, if we're
+/// generating a method call but aren't sure that the method exists, or
+/// if we're emitting a binary operation where one of the inputs may be
+/// a bigint and the other a number.
+///
+/// During lifting, guarded operations will typically be surrounded by
+/// try-catch blocks, although special handling is also possible. For
+/// example, a guarded property load could be lifted as `o?.a`.
+///
+/// Using a guardable operation is more efficient than emitting explicit
+/// try-catch blocks: for one, it allows the outputs of a guarded operation
+/// to be used by subsequent code. Further, it makes it possible to use
+/// runtime instrumentation to fix guarded operations or turn them into
+/// unguarded ones if no runtime exception is raised.
+///
+/// The outputs of guarded operations (i.e. `GuardableOperations`
+/// where the guard is active) should always be typed as `.jsAnything`
+/// by our static type inference. This allows us to try and fix failing
+/// operations at runtime (when we have a full picture of e.g. the methods
+/// that exist on an object or the types of variables available as inputs)
+/// because we know that the following code will not make any specific
+/// assumptions about the type of the outputs.
+/// TODO(rherouart): There are many operations still adding both a try-catch and .? (optional chaining)
+protocol GuardableOperation: JsOperation {
+    var isGuarded: Bool { get }
+    func withGuardedState(_ isGuarded: Bool) -> GuardableOperation
+}
+
+final class LoadInteger: JsOperation {
+    override var opcode: Opcode { .loadInteger(self) }
+
+    let value: Int64
+    let customName: String?
+
+    init(value: Int64, customName: String? = nil) {
+        self.value = value
+        self.customName = customName
+        super.init(numOutputs: 1, attributes: [.isMutable])
+    }
+}
+
+final class LoadBigInt: JsOperation {
+    override var opcode: Opcode { .loadBigInt(self) }
+
+    // This could be a bigger integer type, but it's most likely not worth the effort
+    let value: Int64
+
+    init(value: Int64) {
+        self.value = value
+        super.init(numOutputs: 1, attributes: [.isMutable])
+    }
+}
+
+final class LoadFloat: JsOperation {
+    override var opcode: Opcode { .loadFloat(self) }
+
+    let value: Double
+
+    init(value: Double) {
+        self.value = value
+        super.init(numOutputs: 1, attributes: [.isMutable])
+    }
+}
+
+final class LoadString: JsOperation {
+    override var opcode: Opcode { .loadString(self) }
+
+    let value: String
+    let customName: String?
+
+    init(value: String, customName: String? = nil) {
+        self.value = value
+        self.customName = customName
+        super.init(numOutputs: 1, attributes: [.isMutable])
+    }
+}
+
+final class LoadBoolean: JsOperation {
+    override var opcode: Opcode { .loadBoolean(self) }
+
+    let value: Bool
+
+    init(value: Bool) {
+        self.value = value
+        super.init(numOutputs: 1, attributes: [.isMutable])
+    }
+}
+
+final class LoadUndefined: JsOperation {
+    override var opcode: Opcode { .loadUndefined(self) }
+
+    init() {
+        super.init(numOutputs: 1)
+    }
+}
+
+final class LoadNull: JsOperation {
+    override var opcode: Opcode { .loadNull(self) }
+
+    init() {
+        super.init(numOutputs: 1)
+    }
+}
+
+final class LoadThis: JsOperation {
+    override var opcode: Opcode { .loadThis(self) }
+
+    init() {
+        super.init(numOutputs: 1)
+    }
+}
+
+final class LoadArguments: JsOperation {
+    override var opcode: Opcode { .loadArguments(self) }
+
+    init() {
+        super.init(numOutputs: 1, requiredContext: [.javascript, .subroutine])
+    }
+}
+
+/// Named Variables.
+///
+/// Named variables are variables with a specific name. They are created through the
+/// CreateNamedVariable operation and are useful whenever the name of a variable is
+/// (potentially) important. In particular they are used frequenty when compiling
+/// existing JavaScript code to FuzzIL. Furthermore, named variables are also used to
+/// access builtins as these are effectively just global/pre-existing named variables.
+///
+/// When declaring a new named variable (i.e. when the declarationMode is not .none),
+/// then an initial value must be provided (as first and only input to the operation).
+/// "Uninitialized" named variables can be created by using `undefined` as initial value.
+///
+/// The following code is a simple demonstration of named variables:
+///
+///    // Make an existing named variable (e.g. a builtin) available
+///    v0 <- CreateNamedVariable 'print', declarationMode: .none
+///
+///    // Overwrite an existing named variable
+///    v1 <- CreateNamedVariable 'foo', declarationMode: .none
+///    v2 <- CallFunction v0, v1
+///    v3 <- LoadString 'bar'
+///    Reassign v1, v3
+///
+///    // Declare a new named variable
+///    v4 <- CreateNamedVariable 'baz', declarationMode: .var, v1
+///    v5 <- LoadString 'bla'
+///    Update v4 '+' v5
+///    v5 <- CallFunction v0, v4
+///
+/// This will lift to JavaScript code similar to the following:
+///
+///    print(foo);
+///    foo = "bar";
+///    var baz = foo;
+///    baz += "bla";
+///    print(baz);
+///
+public enum NamedVariableDeclarationMode: CaseIterable {
+    // The variable is assumed to already exist and therefore is not declared again.
+    // This is for example used for global variables and builtins, but also to support
+    // variable and function hoisting where an identifier is used before it is defined.
+    case none
+    // Declare the variable as global variable without any declaration keyword.
+    case global
+    // Declare the variable using the 'var' keyword.
+    case `var`
+    // Declare the variable using the 'let' keyword.
+    case `let`
+    // Declare the variable using the 'const' keyword.
+    case const
+}
+
+final class CreateNamedVariable: JsOperation {
+    override var opcode: Opcode { .createNamedVariable(self) }
+
+    let variableName: String
+    let declarationMode: NamedVariableDeclarationMode
+
+    // Currently, all named variable declarations need an initial value. "undefined" can be
+    // used when no initial value is available, in which case the lifter will not emit an assignment.
+    // We could also consider allowing variable declarations without an initial value, however for
+    // both .global and .const declarations, we always need an initial value to produce valid code.
+    var hasInitialValue: Bool {
+        return declarationMode != .none
+    }
+
+    init(_ name: String, declarationMode: NamedVariableDeclarationMode) {
+        self.variableName = name
+        self.declarationMode = declarationMode
+        super.init(
+            numInputs: declarationMode == .none ? 0 : 1, numOutputs: 1, attributes: .isMutable)
+    }
+}
+
+final class LoadDisposableVariable: JsOperation {
+    override var opcode: Opcode { .loadDisposableVariable(self) }
+
+    init() {
+        // Based on spec text, it is a Syntax error if UsingDeclaration and AwaitUsingDeclaration
+        // are not contained, either directly or indirectly, within a Block, CaseBlock, ForStatement,
+        // ForInOfStatement, FunctionBody, GeneratorBody, AsyncGeneratorBody, AsyncFunctionBody,
+        // or ClassStaticBlockBody.
+        // https://tc39.es/proposal-explicit-resource-management/#sec-let-and-const-declarations-static-semantics-early-errors
+
+        // TODO: Add support for block context to complete LoadDisposableVariable and
+        // LoadAsyncDisposableVariable operations.
+        super.init(numInputs: 1, numOutputs: 1, requiredContext: [.javascript, .subroutine])
+    }
+}
+
+final class CreateNamedDisposableVariable: JsOperation {
+    override var opcode: Opcode { .createNamedDisposableVariable(self) }
+
+    let variableName: String
+
+    init(_ name: String) {
+        self.variableName = name
+        // TODO: Add support for block context, see details above.
+        super.init(numInputs: 1, numOutputs: 1, requiredContext: [.javascript, .subroutine])
+    }
+}
+
+final class LoadAsyncDisposableVariable: JsOperation {
+    override var opcode: Opcode { .loadAsyncDisposableVariable(self) }
+
+    init() {
+        super.init(numInputs: 1, numOutputs: 1, requiredContext: [.javascript, .async])
+    }
+}
+
+final class CreateNamedAsyncDisposableVariable: JsOperation {
+    override var opcode: Opcode { .createNamedAsyncDisposableVariable(self) }
+
+    let variableName: String
+
+    init(_ name: String) {
+        self.variableName = name
+        super.init(numInputs: 1, numOutputs: 1, requiredContext: [.javascript, .async])
+    }
+}
+
+public struct RegExpFlags: OptionSet, Hashable {
+    public let rawValue: UInt32
+
+    public init(rawValue: UInt32) {
+        self.rawValue = rawValue
+    }
+
+    public func asString() -> String {
+        var strRepr = ""
+
+        // These flags are mutually exclusive, will lead to runtime exceptions if used together
+        assert(!(contains(.unicode) && contains(.unicodeSets)))
+
+        for (flag, char) in RegExpFlags.flagToCharDict {
+            if contains(flag) {
+                strRepr += char
+            }
+        }
+        return strRepr
+    }
+
+    public static func fromString(_ str: String) -> RegExpFlags? {
+        var flags = RegExpFlags()
+        for c in str {
+            switch c {
+            case "i":
+                flags.formUnion(.caseInsensitive)
+            case "g":
+                flags.formUnion(.global)
+            case "m":
+                flags.formUnion(.multiline)
+            case "s":
+                flags.formUnion(.dotall)
+            case "u":
+                flags.formUnion(.unicode)
+            case "y":
+                flags.formUnion(.sticky)
+            case "d":
+                flags.formUnion(.hasIndices)
+            case "v":
+                flags.formUnion(.unicodeSets)
+            default:
+                return nil
+            }
+        }
+        // These flags are mutually exclusive, will lead to runtime exceptions if used together
+        assert(!(flags.contains(.unicode) && flags.contains(.unicodeSets)))
+        return flags
+    }
+
+    static let empty = RegExpFlags([])
+    static let caseInsensitive = RegExpFlags(rawValue: 1 << 0)  // i
+    static let global = RegExpFlags(rawValue: 1 << 1)  // g
+    static let multiline = RegExpFlags(rawValue: 1 << 2)  // m
+    static let dotall = RegExpFlags(rawValue: 1 << 3)  // s
+    static let unicode = RegExpFlags(rawValue: 1 << 4)  // u
+    static let sticky = RegExpFlags(rawValue: 1 << 5)  // y
+    static let hasIndices = RegExpFlags(rawValue: 1 << 6)  // d
+    static let unicodeSets = RegExpFlags(rawValue: 1 << 7)  // v
+
+    public static func random() -> RegExpFlags {
+        var flags = RegExpFlags(rawValue: UInt32.random(in: 0..<(1 << 8)))
+        if flags.contains(.unicode) && flags.contains(.unicodeSets) {
+            // clear one of them as they are mutually exclusive, they will throw a runtime exception if used together.
+            withEqualProbability(
+                {
+                    flags.subtract(.unicode)
+                },
+                {
+                    flags.subtract(.unicodeSets)
+                })
+        }
+        return flags
+    }
+
+    private static let flagToCharDict: [RegExpFlags: String] = [
+        .empty: "",
+        .caseInsensitive: "i",
+        .global: "g",
+        .multiline: "m",
+        .dotall: "s",
+        .unicode: "u",
+        .sticky: "y",
+        .hasIndices: "d",
+        .unicodeSets: "v",
+    ]
+
+    static func | (lhs: RegExpFlags, rhs: RegExpFlags) -> RegExpFlags {
+        return RegExpFlags(rawValue: lhs.rawValue | rhs.rawValue)
+    }
+}
+
+final class LoadRegExp: JsOperation {
+    override var opcode: Opcode { .loadRegExp(self) }
+
+    let flags: RegExpFlags
+    let pattern: String
+
+    init(pattern: String, flags: RegExpFlags) {
+        self.pattern = pattern
+        self.flags = flags
+        super.init(numOutputs: 1, attributes: [.isMutable])
+    }
+}
+
+//
+// Object literals
+//
+// In FuzzIL, object literals are represented as special blocks:
+//
+//      BeginObjectLiteral
+//          ObjectLiteralAddProperty 'foo', v13
+//          ObjectLiteralAddElement '0', v9
+//          ObjectLiteralAddComputedProperty v3, v27
+//          ObjectLiteralCopyProperties v42
+//          BeginObjectLiteralMethod 'bar' -> v47, v48
+//              // v47 is the |this| object
+//              ...
+//          EndObjectLiteralMethod
+//          BeginObjectLiteralComputedMethod v19 -> v51, v52
+//              // v51 is the |this| object
+//              ...
+//          EndObjectLiteralComputedMethod
+//          BeginObjectLiteralGetter 'baz' -> v56
+//              // v56 is the |this| object
+//              ...
+//          EndObjectLiteralGetter
+//          BeginObjectLiteralSetter 'baz' -> v60, v61
+//              // v60 is the |this| object, v61 the new value
+//              ...
+//          EndObjectLiteralSetter
+//      v64 <- EndObjectLiteral
+//
+// Note, the output is defined by the EndObjectLiteral operation since the value itself is not available inside the object literal.
+final class BeginObjectLiteral: JsOperation {
+    override var opcode: Opcode { .beginObjectLiteral(self) }
+
+    init() {
+        super.init(attributes: .isBlockStart, contextOpened: .objectLiteral)
+    }
+}
+
+// A "regular" property, for example `"a": 42`,
+final class ObjectLiteralAddProperty: JsOperation {
+    override var opcode: Opcode { .objectLiteralAddProperty(self) }
+
+    let propertyName: String
+
+    init(propertyName: String) {
+        self.propertyName = propertyName
+        super.init(numInputs: 1, attributes: .isMutable, requiredContext: .objectLiteral)
+    }
+}
+
+// An element property, for example `0: v7,`
+final class ObjectLiteralAddElement: JsOperation {
+    override var opcode: Opcode { .objectLiteralAddElement(self) }
+
+    let index: Int64
+
+    init(index: Int64) {
+        self.index = index
+        super.init(numInputs: 1, attributes: .isMutable, requiredContext: .objectLiteral)
+    }
+}
+
+// A computed property, for example `["prop" + v9]: "foobar",`
+final class ObjectLiteralAddComputedProperty: JsOperation {
+    override var opcode: Opcode { .objectLiteralAddComputedProperty(self) }
+
+    init() {
+        super.init(numInputs: 2, requiredContext: .objectLiteral)
+    }
+}
+
+// A spread operation (e.g. `...v13,`) copying the properties from another object
+final class ObjectLiteralCopyProperties: JsOperation {
+    override var opcode: Opcode { .objectLiteralCopyProperties(self) }
+
+    init() {
+        super.init(numInputs: 1, requiredContext: .objectLiteral)
+    }
+}
+
+// Set a custom prototype for this object, for example `"__proto__": Array.prototype`,
+final class ObjectLiteralSetPrototype: JsOperation {
+    override var opcode: Opcode { .objectLiteralSetPrototype(self) }
+
+    init() {
+        // Having duplicate __proto__ fields in an object literal leads to runtime exceptions.
+        super.init(numInputs: 1, attributes: .isSingular, requiredContext: .objectLiteral)
+    }
+}
+
+// A method, for example `someMethod(a3, a4) {`
+final class BeginObjectLiteralMethod: BeginAnySubroutine {
+    override var opcode: Opcode { .beginObjectLiteralMethod(self) }
+
+    let methodName: String
+    let isGenerator: Bool
+    let isAsync: Bool
+
+    init(
+        methodName: String, parameters: Parameters, isGenerator: Bool = false, isAsync: Bool = false
+    ) {
+        self.methodName = methodName
+        self.isGenerator = isGenerator
+        self.isAsync = isAsync
+        // First inner output is the explicit |this| parameter
+        var ctx: Context = [.javascript, .subroutine, .method]
+        if isGenerator { ctx.insert(.generatorFunction) }
+        if isAsync { ctx.insert(.async) }
+        super.init(
+            parameters: parameters, numInnerOutputs: parameters.numInnerOutputs + 1,
+            attributes: [.isBlockStart, .isMutable], requiredContext: .objectLiteral,
+            contextOpened: ctx)
+    }
+}
+
+final class EndObjectLiteralMethod: EndAnySubroutine {
+    override var opcode: Opcode { .endObjectLiteralMethod(self) }
+}
+
+// A computed method, for example `[Symbol.toPrimitive](a3, a4) {`
+final class BeginObjectLiteralComputedMethod: BeginAnySubroutine {
+    override var opcode: Opcode { .beginObjectLiteralComputedMethod(self) }
+
+    let isGenerator: Bool
+    let isAsync: Bool
+
+    init(parameters: Parameters, isGenerator: Bool = false, isAsync: Bool = false) {
+        self.isGenerator = isGenerator
+        self.isAsync = isAsync
+        // First inner output is the explicit |this| parameter
+        var ctx: Context = [.javascript, .subroutine, .method]
+        if isGenerator { ctx.insert(.generatorFunction) }
+        if isAsync { ctx.insert(.async) }
+        super.init(
+            parameters: parameters, numInputs: 1 + parameters.numDefaultParameters,
+            numInnerOutputs: parameters.numInnerOutputs + 1,
+            attributes: .isBlockStart, requiredContext: .objectLiteral,
+            contextOpened: ctx)
+    }
+}
+
+final class EndObjectLiteralComputedMethod: EndAnySubroutine {
+    override var opcode: Opcode { .endObjectLiteralComputedMethod(self) }
+}
+
+// A getter, for example `get prop() {`
+final class BeginObjectLiteralGetter: BeginAnySubroutine {
+    override var opcode: Opcode { .beginObjectLiteralGetter(self) }
+
+    let propertyName: String
+
+    init(propertyName: String) {
+        self.propertyName = propertyName
+        // First inner output is the explicit |this| parameter
+        super.init(
+            parameters: Parameters(count: 0), numInnerOutputs: 1,
+            attributes: [.isBlockStart, .isMutable], requiredContext: .objectLiteral,
+            contextOpened: [.javascript, .subroutine, .method])
+    }
+}
+
+final class EndObjectLiteralGetter: EndAnySubroutine {
+    override var opcode: Opcode { .endObjectLiteralGetter(self) }
+}
+
+final class BeginObjectLiteralComputedGetter: BeginAnySubroutine {
+    override var opcode: Opcode { .beginObjectLiteralComputedGetter(self) }
+
+    init() {
+        // First inner output is the explicit |this| parameter
+        // The first input is the computed property name
+        super.init(
+            parameters: Parameters(count: 0), numInputs: 1, numInnerOutputs: 1,
+            attributes: .isBlockStart, requiredContext: .objectLiteral,
+            contextOpened: [.javascript, .subroutine, .method])
+    }
+}
+
+final class EndObjectLiteralComputedGetter: EndAnySubroutine {
+    override var opcode: Opcode { .endObjectLiteralComputedGetter(self) }
+}
+
+// A setter, for example `set prop(a5) {`
+final class BeginObjectLiteralSetter: BeginAnySubroutine {
+    override var opcode: Opcode { .beginObjectLiteralSetter(self) }
+
+    let propertyName: String
+
+    init(propertyName: String) {
+        self.propertyName = propertyName
+        // First inner output is the explicit |this| parameter
+        super.init(
+            parameters: Parameters(count: 1), numInnerOutputs: 2,
+            attributes: [.isBlockStart, .isMutable], requiredContext: .objectLiteral,
+            contextOpened: [.javascript, .subroutine, .method])
+    }
+}
+
+final class EndObjectLiteralSetter: EndAnySubroutine {
+    override var opcode: Opcode { .endObjectLiteralSetter(self) }
+}
+
+final class BeginObjectLiteralComputedSetter: BeginAnySubroutine {
+    override var opcode: Opcode { .beginObjectLiteralComputedSetter(self) }
+
+    init() {
+        // First inner output is the explicit |this| parameter
+        // The first input is the computed property name
+        super.init(
+            parameters: Parameters(count: 1), numInputs: 1, numInnerOutputs: 2,
+            attributes: .isBlockStart, requiredContext: .objectLiteral,
+            contextOpened: [.javascript, .subroutine, .method])
+    }
+}
+
+final class EndObjectLiteralComputedSetter: EndAnySubroutine {
+    override var opcode: Opcode { .endObjectLiteralComputedSetter(self) }
+}
+
+final class EndObjectLiteral: JsOperation {
+    override var opcode: Opcode { .endObjectLiteral(self) }
+
+    init() {
+        super.init(numOutputs: 1, attributes: .isBlockEnd, requiredContext: .objectLiteral)
+    }
+}
+
+//
+// Classes
+//
+// Classes in FuzzIL look roughly as follows:
+//
+//     v0 <- BeginClassDefinition [optional superclass]
+//         ClassAddInstanceProperty
+//         ClassAddInstanceElement
+//         ClassAddInstanceComputedProperty
+//         BeginClassConstructor -> v1, v2
+//             // v1 is the |this| object
+//             ...
+//         EndClassConstructor
+//         BeginClassInstanceMethod -> v6, v7, v8
+//             // v6 is the |this| object
+//             ...
+//         EndClassInstanceMethod
+//
+//         BeginClassInstanceGetter -> v12
+//             // v12 is the |this| object
+//             ...
+//         EndClassInstanceGetter
+//         BeginClassInstanceSetter -> v18, v19
+//             // v18 is |this|, v19 the new value
+//             ...
+//         EndClassInstanceSetter
+//
+//         ClassAddStaticProperty
+//         ClassAddStaticElement
+//         ClassAddStaticComputedProperty
+//         BeginClassStaticMethod -> v24, v25
+//             // v24 is the |this| object
+//             ...
+//         EndClassStaticMethod
+//         BeginClassStaticInitializer
+//         EndClassStaticInitializer
+//
+//         ClassAddPrivateInstanceProperty
+//         BeginClassPrivateInstanceMethod -> v29
+//             // v29 is the |this| object
+//             ...
+//         EndClassPrivateInstanceMethod
+//         ClassAddPrivateStaticProperty
+//         BeginClassPrivateStaticMethod -> v34, v35
+//             // v34 is the |this| object
+//             ...
+//         EndClassPrivateStaticMethod
+//     EndClassDefinition
+//
+final class BeginClassDefinition: JsOperation {
+    override var opcode: Opcode { .beginClassDefinition(self) }
+
+    let hasSuperclass: Bool
+    let isExpression: Bool
+
+    init(hasSuperclass: Bool, isExpression: Bool) {
+        self.hasSuperclass = hasSuperclass
+        self.isExpression = isExpression
+        super.init(
+            numInputs: hasSuperclass ? 1 : 0, numOutputs: 1, attributes: .isBlockStart,
+            contextOpened: .classDefinition)
+    }
+}
+
+final class BeginClassConstructor: BeginAnySubroutine {
+    override var opcode: Opcode { .beginClassConstructor(self) }
+
+    init(parameters: Parameters) {
+        // First inner output is the explicit |this| parameter
+        super.init(
+            parameters: parameters, numInnerOutputs: parameters.numInnerOutputs + 1,
+            attributes: [.isBlockStart, .isSingular], requiredContext: .classDefinition,
+            contextOpened: [.javascript, .subroutine, .method, .classMethod])
+    }
+}
+
+final class EndClassConstructor: EndAnySubroutine {
+    override var opcode: Opcode { .endClassConstructor(self) }
+}
+
+final class ClassAddProperty: JsOperation {
+    override var opcode: Opcode { .classAddProperty(self) }
+
+    let propertyName: String
+    var hasValue: Bool {
+        return numInputs == 1
+    }
+    let isStatic: Bool
+
+    init(propertyName: String, hasValue: Bool, isStatic: Bool) {
+        self.propertyName = propertyName
+        self.isStatic = isStatic
+        super.init(
+            numInputs: hasValue ? 1 : 0, attributes: .isMutable, requiredContext: .classDefinition)
+    }
+}
+
+final class ClassAddElement: JsOperation {
+    override var opcode: Opcode { .classAddElement(self) }
+
+    let index: Int64
+    var hasValue: Bool {
+        return numInputs == 1
+    }
+    let isStatic: Bool
+
+    init(index: Int64, hasValue: Bool, isStatic: Bool) {
+        self.index = index
+        self.isStatic = isStatic
+        super.init(
+            numInputs: hasValue ? 1 : 0, attributes: .isMutable, requiredContext: .classDefinition)
+    }
+}
+
+final class ClassAddComputedProperty: JsOperation {
+    override var opcode: Opcode { .classAddComputedProperty(self) }
+
+    var hasValue: Bool {
+        return numInputs == 2
+    }
+    let isStatic: Bool
+
+    init(hasValue: Bool, isStatic: Bool) {
+        self.isStatic = isStatic
+        super.init(numInputs: hasValue ? 2 : 1, requiredContext: .classDefinition)
+    }
+}
+
+final class BeginClassMethod: BeginAnySubroutine {
+    override var opcode: Opcode { .beginClassMethod(self) }
+
+    let methodName: String
+    let isStatic: Bool
+    let isGenerator: Bool
+    let isAsync: Bool
+
+    init(
+        methodName: String, parameters: Parameters, isStatic: Bool, isGenerator: Bool = false,
+        isAsync: Bool = false
+    ) {
+        self.methodName = methodName
+        self.isStatic = isStatic
+        self.isGenerator = isGenerator
+        self.isAsync = isAsync
+        // First inner output is the explicit |this| parameter
+        var ctx: Context = [.javascript, .subroutine, .method, .classMethod]
+        if isGenerator { ctx.insert(.generatorFunction) }
+        if isAsync { ctx.insert(.async) }
+        super.init(
+            parameters: parameters, numInnerOutputs: parameters.numInnerOutputs + 1,
+            attributes: [.isMutable, .isBlockStart], requiredContext: .classDefinition,
+            contextOpened: ctx)
+    }
+}
+
+final class EndClassMethod: EndAnySubroutine {
+    override var opcode: Opcode { .endClassMethod(self) }
+}
+
+final class BeginClassComputedMethod: BeginAnySubroutine {
+    override var opcode: Opcode { .beginClassComputedMethod(self) }
+    let isStatic: Bool
+    let isGenerator: Bool
+    let isAsync: Bool
+
+    init(parameters: Parameters, isStatic: Bool, isGenerator: Bool = false, isAsync: Bool = false) {
+        self.isStatic = isStatic
+        self.isGenerator = isGenerator
+        self.isAsync = isAsync
+        // First inner output is the explicit |this| parameter
+        var ctx: Context = [.javascript, .subroutine, .method, .classMethod]
+        if isGenerator { ctx.insert(.generatorFunction) }
+        if isAsync { ctx.insert(.async) }
+        super.init(
+            parameters: parameters, numInputs: 1 + parameters.numDefaultParameters,
+            numInnerOutputs: parameters.numInnerOutputs + 1,
+            attributes: [.isBlockStart], requiredContext: .classDefinition,
+            contextOpened: ctx)
+    }
+}
+
+final class EndClassComputedMethod: EndAnySubroutine {
+    override var opcode: Opcode { .endClassComputedMethod(self) }
+}
+
+final class BeginClassGetter: BeginAnySubroutine {
+    override var opcode: Opcode { .beginClassGetter(self) }
+
+    let propertyName: String
+    let isStatic: Bool
+
+    init(propertyName: String, isStatic: Bool) {
+        self.propertyName = propertyName
+        self.isStatic = isStatic
+        // First inner output is the explicit |this| parameter
+        super.init(
+            parameters: Parameters(count: 0), numInnerOutputs: 1,
+            attributes: [.isBlockStart, .isMutable], requiredContext: .classDefinition,
+            contextOpened: [.javascript, .subroutine, .method, .classMethod])
+    }
+}
+
+final class EndClassGetter: EndAnySubroutine {
+    override var opcode: Opcode { .endClassGetter(self) }
+}
+
+final class BeginClassComputedGetter: BeginAnySubroutine {
+    override var opcode: Opcode { .beginClassComputedGetter(self) }
+    let isStatic: Bool
+
+    init(isStatic: Bool) {
+        self.isStatic = isStatic
+        // First inner output is the explicit |this| parameter
+        // The first input is the computed property name
+        super.init(
+            parameters: Parameters(count: 0), numInputs: 1, numInnerOutputs: 1,
+            attributes: .isBlockStart, requiredContext: .classDefinition,
+            contextOpened: [.javascript, .subroutine, .method, .classMethod])
+    }
+}
+
+final class EndClassComputedGetter: EndAnySubroutine {
+    override var opcode: Opcode { .endClassComputedGetter(self) }
+}
+
+final class BeginClassSetter: BeginAnySubroutine {
+    override var opcode: Opcode { .beginClassSetter(self) }
+
+    let propertyName: String
+    let isStatic: Bool
+
+    init(propertyName: String, isStatic: Bool) {
+        self.propertyName = propertyName
+        self.isStatic = isStatic
+        // First inner output is the explicit |this| parameter
+        super.init(
+            parameters: Parameters(count: 1), numInnerOutputs: 2,
+            attributes: [.isBlockStart, .isMutable], requiredContext: .classDefinition,
+            contextOpened: [.javascript, .subroutine, .method, .classMethod])
+    }
+}
+
+final class EndClassSetter: EndAnySubroutine {
+    override var opcode: Opcode { .endClassSetter(self) }
+}
+
+final class BeginClassComputedSetter: BeginAnySubroutine {
+    override var opcode: Opcode { .beginClassComputedSetter(self) }
+    let isStatic: Bool
+
+    init(isStatic: Bool) {
+        self.isStatic = isStatic
+        // First inner output is the explicit |this| parameter
+        // The first input is the computed property name
+        super.init(
+            parameters: Parameters(count: 1), numInputs: 1, numInnerOutputs: 2,
+            attributes: .isBlockStart, requiredContext: .classDefinition,
+            contextOpened: [.javascript, .subroutine, .method, .classMethod])
+    }
+}
+
+final class EndClassComputedSetter: EndAnySubroutine {
+    override var opcode: Opcode { .endClassComputedSetter(self) }
+}
+
+final class BeginClassStaticInitializer: JsOperation {
+    override var opcode: Opcode { .beginClassStaticInitializer(self) }
+
+    init() {
+        // Inner output is the explicit |this| parameter
+        // Static initializer blocks do not have .subroutine context as `return` is disallowed inside of them.
+        super.init(
+            numInnerOutputs: 1, attributes: .isBlockStart, requiredContext: .classDefinition,
+            contextOpened: [.javascript, .method, .classMethod])
+    }
+}
+
+final class EndClassStaticInitializer: JsOperation {
+    override var opcode: Opcode { .endClassStaticInitializer(self) }
+
+    init() {
+        super.init(attributes: .isBlockEnd)
+    }
+}
+
+final class ClassAddPrivateProperty: JsOperation {
+    override var opcode: Opcode { .classAddPrivateProperty(self) }
+
+    let propertyName: String
+    var hasValue: Bool {
+        return numInputs == 1
+    }
+    let isStatic: Bool
+
+    init(propertyName: String, hasValue: Bool, isStatic: Bool) {
+        self.propertyName = propertyName
+        self.isStatic = isStatic
+        // We currently don't want to change the names of private properties since that has a good chance of making
+        // following code _syntactically_ incorrect (if it uses them) because an undeclared private field is accessed.
+        super.init(numInputs: hasValue ? 1 : 0, requiredContext: .classDefinition)
+    }
+}
+
+final class BeginClassPrivateMethod: BeginAnySubroutine {
+    override var opcode: Opcode { .beginClassPrivateMethod(self) }
+
+    let methodName: String
+    let isStatic: Bool
+    let isGenerator: Bool
+    let isAsync: Bool
+
+    init(
+        methodName: String, parameters: Parameters, isStatic: Bool, isGenerator: Bool = false,
+        isAsync: Bool = false
+    ) {
+        self.methodName = methodName
+        self.isStatic = isStatic
+        self.isGenerator = isGenerator
+        self.isAsync = isAsync
+        // First inner output is the explicit |this| parameter.
+        // See comment in ClassAddPrivateProperty for why this operation isn't mutable.
+        var ctx: Context = [.javascript, .subroutine, .method, .classMethod]
+        if isGenerator { ctx.insert(.generatorFunction) }
+        if isAsync { ctx.insert(.async) }
+        super.init(
+            parameters: parameters, numInnerOutputs: parameters.numInnerOutputs + 1,
+            attributes: .isBlockStart, requiredContext: .classDefinition,
+            contextOpened: ctx)
+    }
+}
+
+final class EndClassPrivateMethod: EndAnySubroutine {
+    override var opcode: Opcode { .endClassPrivateMethod(self) }
+}
+
+final class BeginClassPrivateGetter: BeginAnySubroutine {
+    override var opcode: Opcode { .beginClassPrivateGetter(self) }
+
+    let propertyName: String
+    let isStatic: Bool
+
+    init(propertyName: String, isStatic: Bool) {
+        self.propertyName = propertyName
+        self.isStatic = isStatic
+        // First inner output is the explicit |this| parameter
+        super.init(
+            parameters: Parameters(count: 0), numInnerOutputs: 1,
+            attributes: [.isBlockStart], requiredContext: .classDefinition,
+            contextOpened: [.javascript, .subroutine, .method, .classMethod])
+    }
+}
+
+final class EndClassPrivateGetter: EndAnySubroutine {
+    override var opcode: Opcode { .endClassPrivateGetter(self) }
+}
+
+final class BeginClassPrivateSetter: BeginAnySubroutine {
+    override var opcode: Opcode { .beginClassPrivateSetter(self) }
+
+    let propertyName: String
+    let isStatic: Bool
+
+    init(propertyName: String, isStatic: Bool) {
+        self.propertyName = propertyName
+        self.isStatic = isStatic
+        // First inner output is the explicit |this| parameter, second is the setter argument
+        super.init(
+            parameters: Parameters(count: 1), numInnerOutputs: 2,
+            attributes: [.isBlockStart], requiredContext: .classDefinition,
+            contextOpened: [.javascript, .subroutine, .method, .classMethod])
+    }
+}
+
+final class EndClassPrivateSetter: EndAnySubroutine {
+    override var opcode: Opcode { .endClassPrivateSetter(self) }
+}
+
+final class EndClassDefinition: JsOperation {
+    override var opcode: Opcode { .endClassDefinition(self) }
+
+    init() {
+        super.init(attributes: .isBlockEnd, requiredContext: .classDefinition)
+    }
+}
+
+final class CreateArray: JsOperation {
+    override var opcode: Opcode { .createArray(self) }
+
+    var numInitialValues: Int {
+        return numInputs
+    }
+
+    let elementGroupName: String?
+
+    init(numInitialValues: Int, elementGroupName: String? = nil) {
+        self.elementGroupName = elementGroupName
+        super.init(
+            numInputs: numInitialValues, numOutputs: 1, firstVariadicInput: 0,
+            attributes: [.isVariadic])
+    }
+}
+
+final class CreateIntArray: JsOperation {
+    override var opcode: Opcode { .createIntArray(self) }
+
+    let values: [Int64]
+
+    init(values: [Int64]) {
+        self.values = values
+        super.init(numOutputs: 1, attributes: .isMutable)
+    }
+}
+
+final class CreateFloatArray: JsOperation {
+    override var opcode: Opcode { .createFloatArray(self) }
+
+    let values: [Double]
+
+    init(values: [Double]) {
+        self.values = values
+        super.init(numOutputs: 1, attributes: .isMutable)
+    }
+}
+
+final class CreateArrayWithSpread: JsOperation {
+    override var opcode: Opcode { .createArrayWithSpread(self) }
+
+    // Which inputs to spread.
+    let spreads: [Bool]
+
+    init(spreads: [Bool]) {
+        self.spreads = spreads
+        var flags: Operation.Attributes = [.isVariadic]
+        if spreads.count > 0 {
+            flags.insert(.isMutable)
+        }
+        super.init(
+            numInputs: spreads.count, numOutputs: 1, firstVariadicInput: 0, attributes: flags)
+    }
+}
+
+final class CreateTemplateString: JsOperation {
+    override var opcode: Opcode { .createTemplateString(self) }
+
+    // Stores the string elements of the template literal
+    let parts: [String]
+
+    var numInterpolatedValues: Int {
+        return numInputs
+    }
+
+    init(parts: [String]) {
+        assert(parts.count > 0)
+        self.parts = parts
+        super.init(
+            numInputs: parts.count - 1, numOutputs: 1, firstVariadicInput: 0,
+            attributes: [.isMutable, .isVariadic])
+    }
+}
+
+final class GetProperty: JsOperation, GuardableOperation {
+    override var opcode: Opcode { .getProperty(self) }
+
+    let isGuarded: Bool
+
+    let propertyName: String
+
+    init(propertyName: String, isGuarded: Bool) {
+        self.propertyName = propertyName
+        self.isGuarded = isGuarded
+        super.init(numInputs: 1, numOutputs: 1, attributes: .isMutable)
+    }
+
+    func withGuardedState(_ isGuarded: Bool) -> GuardableOperation {
+        return GetProperty(propertyName: propertyName, isGuarded: isGuarded)
+    }
+}
+
+final class SetProperty: JsOperation, GuardableOperation {
+    override var opcode: Opcode { .setProperty(self) }
+
+    let isGuarded: Bool
+
+    let propertyName: String
+
+    init(propertyName: String, isGuarded: Bool) {
+        self.propertyName = propertyName
+        self.isGuarded = isGuarded
+        super.init(numInputs: 2, attributes: .isMutable)
+    }
+
+    func withGuardedState(_ isGuarded: Bool) -> GuardableOperation {
+        return SetProperty(propertyName: propertyName, isGuarded: isGuarded)
+    }
+}
+
+final class UpdateProperty: JsOperation {
+    override var opcode: Opcode { .updateProperty(self) }
+
+    let propertyName: String
+    let op: BinaryOperator
+
+    init(propertyName: String, operator op: BinaryOperator) {
+        self.propertyName = propertyName
+        self.op = op
+        super.init(numInputs: 2, attributes: .isMutable)
+    }
+}
+
+final class DeleteProperty: JsOperation, GuardableOperation {
+    override var opcode: Opcode { .deleteProperty(self) }
+
+    let isGuarded: Bool
+
+    let propertyName: String
+
+    init(propertyName: String, isGuarded: Bool) {
+        self.propertyName = propertyName
+        self.isGuarded = isGuarded
+        super.init(numInputs: 1, numOutputs: 1, attributes: .isMutable)
+    }
+
+    func withGuardedState(_ isGuarded: Bool) -> GuardableOperation {
+        return DeleteProperty(propertyName: propertyName, isGuarded: isGuarded)
+    }
+}
+
+public struct PropertyFlags: OptionSet {
+    public let rawValue: UInt8
+
+    public init(rawValue: UInt8) {
+        self.rawValue = rawValue
+    }
+
+    static let writable = PropertyFlags(rawValue: 1 << 0)
+    static let configurable = PropertyFlags(rawValue: 1 << 1)
+    static let enumerable = PropertyFlags(rawValue: 1 << 2)
+
+    public static func random() -> PropertyFlags {
+        return PropertyFlags(rawValue: UInt8.random(in: 0..<8))
+    }
+
+    public static func randomWithoutWritable() -> PropertyFlags {
+        random().subtracting(.writable)
+    }
+}
+
+enum PropertyType: CaseIterable {
+    case value
+    case getter
+    case setter
+    case getterSetter
+}
+
+final class ConfigureProperty: JsOperation {
+    override var opcode: Opcode { .configureProperty(self) }
+
+    let propertyName: String
+    let flags: PropertyFlags
+    let type: PropertyType
+
+    init(propertyName: String, flags: PropertyFlags, type: PropertyType) {
+        self.propertyName = propertyName
+        self.flags = flags
+        self.type = type
+        super.init(numInputs: type == .getterSetter ? 3 : 2, attributes: .isMutable)
+    }
+}
+
+final class GetElement: JsOperation, GuardableOperation {
+    override var opcode: Opcode { .getElement(self) }
+
+    let isGuarded: Bool
+
+    let index: Int64
+
+    init(index: Int64, isGuarded: Bool) {
+        self.index = index
+        self.isGuarded = isGuarded
+        super.init(numInputs: 1, numOutputs: 1, attributes: .isMutable)
+    }
+
+    func withGuardedState(_ isGuarded: Bool) -> GuardableOperation {
+        return GetElement(index: index, isGuarded: isGuarded)
+    }
+}
+
+final class SetElement: JsOperation {
+    override var opcode: Opcode { .setElement(self) }
+
+    let index: Int64
+
+    init(index: Int64) {
+        self.index = index
+        super.init(numInputs: 2, attributes: .isMutable)
+    }
+}
+
+final class UpdateElement: JsOperation {
+    override var opcode: Opcode { .updateElement(self) }
+
+    let index: Int64
+    let op: BinaryOperator
+
+    init(index: Int64, operator op: BinaryOperator) {
+        self.index = index
+        self.op = op
+        super.init(numInputs: 2, attributes: .isMutable)
+    }
+}
+
+final class DeleteElement: JsOperation, GuardableOperation {
+    override var opcode: Opcode { .deleteElement(self) }
+
+    let isGuarded: Bool
+
+    let index: Int64
+
+    init(index: Int64, isGuarded: Bool) {
+        self.index = index
+        self.isGuarded = isGuarded
+        super.init(numInputs: 1, numOutputs: 1, attributes: .isMutable)
+    }
+
+    func withGuardedState(_ isGuarded: Bool) -> GuardableOperation {
+        return DeleteElement(index: index, isGuarded: isGuarded)
+    }
+}
+
+final class ConfigureElement: JsOperation {
+    override var opcode: Opcode { .configureElement(self) }
+
+    let index: Int64
+    let flags: PropertyFlags
+    let type: PropertyType
+
+    init(index: Int64, flags: PropertyFlags, type: PropertyType) {
+        self.index = index
+        self.flags = flags
+        self.type = type
+        super.init(numInputs: type == .getterSetter ? 3 : 2, attributes: .isMutable)
+    }
+}
+
+final class GetComputedProperty: JsOperation, GuardableOperation {
+    override var opcode: Opcode { .getComputedProperty(self) }
+
+    let isGuarded: Bool
+
+    init(isGuarded: Bool) {
+        self.isGuarded = isGuarded
+        super.init(numInputs: 2, numOutputs: 1)
+    }
+
+    func withGuardedState(_ isGuarded: Bool) -> GuardableOperation {
+        return GetComputedProperty(isGuarded: isGuarded)
+    }
+}
+
+final class SetComputedProperty: JsOperation {
+    override var opcode: Opcode { .setComputedProperty(self) }
+
+    init() {
+        super.init(numInputs: 3, numOutputs: 0)
+    }
+}
+
+final class UpdateComputedProperty: JsOperation {
+    override var opcode: Opcode { .updateComputedProperty(self) }
+
+    let op: BinaryOperator
+
+    init(operator op: BinaryOperator) {
+        self.op = op
+        super.init(numInputs: 3, numOutputs: 0)
+    }
+}
+
+final class DeleteComputedProperty: JsOperation, GuardableOperation {
+    override var opcode: Opcode { .deleteComputedProperty(self) }
+
+    let isGuarded: Bool
+
+    init(isGuarded: Bool) {
+        self.isGuarded = isGuarded
+        super.init(numInputs: 2, numOutputs: 1)
+    }
+
+    func withGuardedState(_ isGuarded: Bool) -> GuardableOperation {
+        return DeleteComputedProperty(isGuarded: isGuarded)
+    }
+}
+
+final class ConfigureComputedProperty: JsOperation {
+    override var opcode: Opcode { .configureComputedProperty(self) }
+
+    let flags: PropertyFlags
+    let type: PropertyType
+
+    init(flags: PropertyFlags, type: PropertyType) {
+        self.flags = flags
+        self.type = type
+        super.init(numInputs: type == .getterSetter ? 4 : 3, attributes: .isMutable)
+    }
+}
+
+final class TypeOf: JsOperation {
+    override var opcode: Opcode { .typeOf(self) }
+
+    init() {
+        super.init(numInputs: 1, numOutputs: 1)
+    }
+}
+
+final class Void_: JsOperation {
+    override var opcode: Opcode { .void(self) }
+
+    init() {
+        super.init(numInputs: 1, numOutputs: 1)
+    }
+}
+
+final class TestInstanceOf: JsOperation {
+    override var opcode: Opcode { .testInstanceOf(self) }
+
+    init() {
+        super.init(numInputs: 2, numOutputs: 1)
+    }
+}
+
+final class TestIn: JsOperation {
+    override var opcode: Opcode { .testIn(self) }
+
+    init() {
+        super.init(numInputs: 2, numOutputs: 1)
+    }
+
+}
+
+// The parameters of a FuzzIL subroutine.
+public struct Parameters {
+    /// The total number of parameters.
+    private let numParameters: UInt32
+    /// Whether the last parameter is a rest parameter.
+    let hasRestParameter: Bool
+    /// Indices of parameters that have a default value.
+    /// The n-th default parameter will be the n-th input to the BeginAnySubroutine instruction.
+    let defaultParameterIndices: [Int]
+    let destructuringParameters: [Int: DestructuringPattern]
+
+    var count: Int {
+        return Int(numParameters)
+    }
+
+    var numInnerOutputs: Int {
+        // Without destructuring, the number of inner outputs is equal to the number of parameters.
+        // With destructuring, the number of inner outputs might be different (larger or smaller).
+        // It could be smaller if empty patterns are used (which don't create bindings), or larger
+        // if nested patterns extract multiple inner bindings.
+        var totalBindings = count - destructuringParameters.count
+        for pattern in destructuringParameters.values {
+            totalBindings += pattern.numberOfBindings
+        }
+        return totalBindings
+    }
+
+    var numDefaultParameters: Int {
+        return defaultParameterIndices.count
+    }
+
+    init(
+        count: Int, hasRestParameter: Bool = false, defaultParameterIndices: [Int] = [],
+        destructuringParameters: [Int: DestructuringPattern] = [:]
+    ) {
+        assert(
+            !hasRestParameter || !defaultParameterIndices.contains(count - 1),
+            "Rest parameter cannot have a default value")
+        assert(
+            defaultParameterIndices.allSatisfy({ $0 >= 0 && $0 < count }),
+            "Invalid default parameter index")
+        assert(
+            defaultParameterIndices == defaultParameterIndices.sorted(),
+            "Default parameter indices must be sorted")
+        self.numParameters = UInt32(count)
+        self.hasRestParameter = hasRestParameter
+        self.defaultParameterIndices = defaultParameterIndices
+        self.destructuringParameters = destructuringParameters
+    }
+}
+
+// Subroutine definitions.
+// A subroutine is the umbrella term for any invocable unit of code. Functions, (class) constructors, and methods are all subroutines.
+// This intermediate Operation class contains the parameters of the surbroutine and makes it easy to identify whenever .subroutine context is opened.
+class BeginAnySubroutine: JsOperation {
+    let parameters: Parameters
+
+    init(
+        parameters: Parameters, numInputs: Int? = nil, numOutputs: Int = 0,
+        numInnerOutputs: Int = 0, attributes: Operation.Attributes = .isBlockStart,
+        requiredContext: Context = .javascript, contextOpened: Context
+    ) {
+        assert(contextOpened.contains(.subroutine))
+        assert(attributes.contains(.isBlockStart))
+        self.parameters = parameters
+        // Note: The number of inputs in subroutines is by default calculated by the number of default parameters.
+        // With destructuring patterns, some inputs would be needed for inner defaults and computed keys,
+        // but these are currently not supported yet (see tests). This holds for all supported subroutines.
+        super.init(
+            numInputs: numInputs ?? parameters.numDefaultParameters, numOutputs: numOutputs,
+            numInnerOutputs: numInnerOutputs, attributes: attributes,
+            requiredContext: requiredContext, contextOpened: contextOpened)
+    }
+}
+
+class EndAnySubroutine: JsOperation {
+    init() {
+        super.init(attributes: [.isBlockEnd])
+    }
+}
+
+// Function definitions.
+// Roughly speaking, a function is any subroutine that is supposed to be invoked via CallFunction. In JavaScript, they are typically defined through the 'function' keyword or an arrow function.
+// Functions beginnings are not considered mutable since it likely makes little sense to change things like the number of parameters.
+class BeginAnyFunction: BeginAnySubroutine {
+    init(parameters: Parameters, contextOpened: Context = [.javascript, .subroutine]) {
+        super.init(
+            parameters: parameters,
+            numInputs: parameters.numDefaultParameters,
+            numOutputs: 1,
+            numInnerOutputs: parameters.numInnerOutputs,
+            contextOpened: contextOpened)
+    }
+}
+class EndAnyFunction: EndAnySubroutine {}
+
+// Functions that can (optionally) be given a name.
+class BeginAnyNamedFunction: BeginAnyFunction {
+    // If the function has no name (the name is nil), then a  name is automatically assigned
+    // during lifting. Typically it will be something like `f3`, and the lifter guarantees
+    // that there are no name collisions with other functions.
+    // If a name is present, the lifter will use that for the function. In that case, the
+    // lifter cannot guarantee that there are no name collisions with other named functions.
+    let functionName: String?
+
+    init(
+        parameters: Parameters, functionName: String?,
+        contextOpened: Context = [.javascript, .subroutine]
+    ) {
+        assert(functionName == nil || !functionName!.isEmpty)
+        self.functionName = functionName
+        super.init(parameters: parameters, contextOpened: contextOpened)
+    }
+}
+
+// A plain function
+final class BeginPlainFunction: BeginAnyNamedFunction {
+    override var opcode: Opcode { .beginPlainFunction(self) }
+}
+final class EndPlainFunction: EndAnyFunction {
+    override var opcode: Opcode { .endPlainFunction(self) }
+}
+
+// A plain function which doesn't use any variables from the outside.
+// Suitable for converting to a string and transmitting to a Worker.
+final class BeginWorkerFunction: BeginAnyNamedFunction {
+    override var opcode: Opcode { .beginWorkerFunction(self) }
+
+    init(parameters: Parameters, functionName: String?) {
+        super.init(
+            parameters: parameters, functionName: functionName,
+            contextOpened: [.javascript, .subroutine, .workerFunction])
+    }
+}
+final class EndWorkerFunction: EndAnyFunction {
+    override var opcode: Opcode { .endWorkerFunction(self) }
+}
+
+// A ES6 arrow function
+final class BeginArrowFunction: BeginAnyFunction {
+    override var opcode: Opcode { .beginArrowFunction(self) }
+}
+final class EndArrowFunction: EndAnyFunction {
+    override var opcode: Opcode { .endArrowFunction(self) }
+}
+
+// A ES6 generator function
+final class BeginGeneratorFunction: BeginAnyNamedFunction {
+    override var opcode: Opcode { .beginGeneratorFunction(self) }
+
+    init(parameters: Parameters, functionName: String?) {
+        super.init(
+            parameters: parameters, functionName: functionName,
+            contextOpened: [.javascript, .subroutine, .generatorFunction])
+    }
+}
+final class EndGeneratorFunction: EndAnyFunction {
+    override var opcode: Opcode { .endGeneratorFunction(self) }
+}
+
+// A ES6 async function
+final class BeginAsyncFunction: BeginAnyNamedFunction {
+    override var opcode: Opcode { .beginAsyncFunction(self) }
+
+    init(parameters: Parameters, functionName: String?) {
+        super.init(
+            parameters: parameters, functionName: functionName,
+            contextOpened: [.javascript, .subroutine, .async])
+    }
+}
+final class EndAsyncFunction: EndAnyFunction {
+    override var opcode: Opcode { .endAsyncFunction(self) }
+}
+
+// A ES6 async arrow function
+final class BeginAsyncArrowFunction: BeginAnyFunction {
+    override var opcode: Opcode { .beginAsyncArrowFunction(self) }
+
+    init(parameters: Parameters) {
+        super.init(
+            parameters: parameters, contextOpened: [.javascript, .subroutine, .async])
+    }
+}
+final class EndAsyncArrowFunction: EndAnyFunction {
+    override var opcode: Opcode { .endAsyncArrowFunction(self) }
+}
+
+// A ES6 async generator function
+final class BeginAsyncGeneratorFunction: BeginAnyNamedFunction {
+    override var opcode: Opcode { .beginAsyncGeneratorFunction(self) }
+
+    init(parameters: Parameters, functionName: String?) {
+        super.init(
+            parameters: parameters, functionName: functionName,
+            contextOpened: [.javascript, .subroutine, .async, .generatorFunction])
+    }
+}
+final class EndAsyncGeneratorFunction: EndAnyFunction {
+    override var opcode: Opcode { .endAsyncGeneratorFunction(self) }
+}
+
+// A constructor.
+// This will also be lifted to a plain function in JavaScript. However, in FuzzIL it has an explicit |this| parameter as first inner output.
+// A constructor is not a function since it is supposed to be constructed, not called.
+final class BeginConstructor: BeginAnySubroutine {
+    override var opcode: Opcode { .beginConstructor(self) }
+
+    init(parameters: Parameters) {
+        super.init(
+            parameters: parameters, numOutputs: 1, numInnerOutputs: parameters.numInnerOutputs + 1,
+            contextOpened: [.javascript, .subroutine])
+    }
+}
+final class EndConstructor: EndAnySubroutine {
+    override var opcode: Opcode { .endConstructor(self) }
+}
+
+// A directive for the JavaScript engine.
+//
+// These are strings such as "use strict" that have special meaning
+// if placed at the top of a function. Support in FuzzIL is very basic
+// and simple: a directive is simply a string for which a string literal
+// will be created in the generated JavaScript code. There is also no
+// guarantee that these will be placed at the start of a function's body,
+// and due to mutations they might appear elsewhere in a program (which
+// is probably a feature). They will also quickly be removed by the
+// minimizer if they are not important (which is probably also desirable
+// as strict mode function are more likely to raise exceptions).
+final class Directive: JsOperation {
+    override var opcode: Opcode { .directive(self) }
+
+    let content: String
+
+    init(_ content: String) {
+        // Currently we only support "use strict" and don't support mutating the content.
+        // We could easily change both of these constraints and allow arbitrary directives
+        // or a list of known directives if we deem that useful in the future though.
+        assert(content == "use strict")
+        self.content = content
+        super.init(numInputs: 0, numOutputs: 0, attributes: [], requiredContext: [.javascript])
+    }
+}
+
+final class Return: JsOperation {
+    override var opcode: Opcode { .return(self) }
+
+    var hasReturnValue: Bool {
+        assert(numInputs == 0 || numInputs == 1)
+        return numInputs == 1
+    }
+
+    init(hasReturnValue: Bool) {
+        super.init(
+            numInputs: hasReturnValue ? 1 : 0, attributes: [.isJump],
+            requiredContext: [.javascript, .subroutine])
+    }
+}
+
+// A yield expression in JavaScript
+final class Yield: JsOperation {
+    override var opcode: Opcode { .yield(self) }
+
+    var hasArgument: Bool {
+        assert(numInputs == 0 || numInputs == 1)
+        return numInputs == 1
+    }
+
+    init(hasArgument: Bool) {
+        super.init(
+            numInputs: hasArgument ? 1 : 0, numOutputs: 1, attributes: [],
+            requiredContext: [.javascript, .generatorFunction])
+    }
+}
+
+// A yield* expression in JavaScript
+final class YieldEach: JsOperation {
+    override var opcode: Opcode { .yieldEach(self) }
+
+    init() {
+        super.init(
+            numInputs: 1, attributes: [], requiredContext: [.javascript, .generatorFunction])
+    }
+}
+
+final class Await: JsOperation {
+    override var opcode: Opcode { .await(self) }
+
+    init() {
+        super.init(
+            numInputs: 1, numOutputs: 1, attributes: [],
+            requiredContext: [.javascript, .async])
+    }
+}
+
+final class CallFunction: JsOperation, GuardableOperation {
+    override var opcode: Opcode { .callFunction(self) }
+
+    let isGuarded: Bool
+
+    var numArguments: Int {
+        return numInputs - 1
+    }
+
+    init(numArguments: Int, isGuarded: Bool) {
+        // The called function is the first input.
+        self.isGuarded = isGuarded
+        super.init(
+            numInputs: numArguments + 1, numOutputs: 1, firstVariadicInput: 1,
+            attributes: [.isVariadic, .isCall])
+    }
+
+    func withGuardedState(_ isGuarded: Bool) -> GuardableOperation {
+        return CallFunction(numArguments: numArguments, isGuarded: isGuarded)
+    }
+}
+
+final class CallFunctionWithSpread: JsOperation, GuardableOperation {
+    override var opcode: Opcode { .callFunctionWithSpread(self) }
+
+    let isGuarded: Bool
+
+    let spreads: [Bool]
+
+    var numArguments: Int {
+        return numInputs - 1
+    }
+
+    init(numArguments: Int, spreads: [Bool], isGuarded: Bool) {
+        assert(!spreads.isEmpty)
+        assert(spreads.count == numArguments)
+        self.spreads = spreads
+        // The called function is the first input.
+        self.isGuarded = isGuarded
+        super.init(
+            numInputs: numArguments + 1, numOutputs: 1, firstVariadicInput: 1,
+            attributes: [.isVariadic, .isCall, .isMutable])
+    }
+
+    func withGuardedState(_ isGuarded: Bool) -> GuardableOperation {
+        return CallFunctionWithSpread(
+            numArguments: numArguments, spreads: spreads, isGuarded: isGuarded)
+    }
+}
+
+final class Construct: JsOperation, GuardableOperation {
+    override var opcode: Opcode { .construct(self) }
+
+    let isGuarded: Bool
+
+    var numArguments: Int {
+        return numInputs - 1
+    }
+
+    init(numArguments: Int, isGuarded: Bool) {
+        // The constructor is the first input
+        self.isGuarded = isGuarded
+        super.init(
+            numInputs: numArguments + 1, numOutputs: 1, firstVariadicInput: 1,
+            attributes: [.isVariadic, .isCall])
+    }
+
+    func withGuardedState(_ isGuarded: Bool) -> GuardableOperation {
+        return Construct(numArguments: numArguments, isGuarded: isGuarded)
+    }
+}
+
+final class ConstructWithSpread: JsOperation, GuardableOperation {
+    override var opcode: Opcode { .constructWithSpread(self) }
+
+    let isGuarded: Bool
+
+    let spreads: [Bool]
+
+    var numArguments: Int {
+        return numInputs - 1
+    }
+
+    init(numArguments: Int, spreads: [Bool], isGuarded: Bool) {
+        assert(!spreads.isEmpty)
+        assert(spreads.count == numArguments)
+        self.spreads = spreads
+        // The constructor is the first input
+        self.isGuarded = isGuarded
+        super.init(
+            numInputs: numArguments + 1, numOutputs: 1, firstVariadicInput: 1,
+            attributes: [.isVariadic, .isCall, .isMutable])
+    }
+
+    func withGuardedState(_ isGuarded: Bool) -> GuardableOperation {
+        return ConstructWithSpread(
+            numArguments: numArguments, spreads: spreads, isGuarded: isGuarded)
+    }
+}
+
+final class CallMethod: JsOperation, GuardableOperation {
+    override var opcode: Opcode { .callMethod(self) }
+
+    let isGuarded: Bool
+
+    let methodName: String
+
+    var numArguments: Int {
+        return numInputs - 1
+    }
+
+    init(methodName: String, numArguments: Int, isGuarded: Bool) {
+        self.methodName = methodName
+        // The reference object is the first input
+        self.isGuarded = isGuarded
+        super.init(
+            numInputs: numArguments + 1, numOutputs: 1, firstVariadicInput: 1,
+            attributes: [.isMutable, .isVariadic, .isCall])
+    }
+
+    func withGuardedState(_ isGuarded: Bool) -> GuardableOperation {
+        return CallMethod(methodName: methodName, numArguments: numArguments, isGuarded: isGuarded)
+    }
+}
+
+final class CallMethodWithSpread: JsOperation, GuardableOperation {
+    override var opcode: Opcode { .callMethodWithSpread(self) }
+
+    let isGuarded: Bool
+
+    let methodName: String
+    let spreads: [Bool]
+
+    var numArguments: Int {
+        return numInputs - 1
+    }
+
+    init(methodName: String, numArguments: Int, spreads: [Bool], isGuarded: Bool) {
+        assert(!spreads.isEmpty)
+        assert(spreads.count == numArguments)
+        self.methodName = methodName
+        self.spreads = spreads
+        // The reference object is the first input
+        self.isGuarded = isGuarded
+        super.init(
+            numInputs: numArguments + 1, numOutputs: 1, firstVariadicInput: 1,
+            attributes: [.isMutable, .isVariadic, .isCall])
+    }
+
+    func withGuardedState(_ isGuarded: Bool) -> GuardableOperation {
+        return CallMethodWithSpread(
+            methodName: methodName, numArguments: numArguments, spreads: spreads,
+            isGuarded: isGuarded)
+    }
+}
+
+final class CallComputedMethod: JsOperation, GuardableOperation {
+    override var opcode: Opcode { .callComputedMethod(self) }
+
+    let isGuarded: Bool
+
+    var numArguments: Int {
+        return numInputs - 2
+    }
+
+    init(numArguments: Int, isGuarded: Bool) {
+        // The reference object is the first input and the method name is the second input
+        self.isGuarded = isGuarded
+        super.init(
+            numInputs: numArguments + 2, numOutputs: 1, firstVariadicInput: 2,
+            attributes: [.isVariadic, .isCall])
+    }
+
+    func withGuardedState(_ isGuarded: Bool) -> GuardableOperation {
+        return CallComputedMethod(numArguments: numArguments, isGuarded: isGuarded)
+    }
+}
+
+final class CallComputedMethodWithSpread: JsOperation, GuardableOperation {
+    override var opcode: Opcode { .callComputedMethodWithSpread(self) }
+
+    let isGuarded: Bool
+
+    let spreads: [Bool]
+
+    var numArguments: Int {
+        return numInputs - 2
+    }
+
+    init(numArguments: Int, spreads: [Bool], isGuarded: Bool) {
+        assert(!spreads.isEmpty)
+        assert(spreads.count == numArguments)
+        self.spreads = spreads
+        // The reference object is the first input and the method name is the second input
+        self.isGuarded = isGuarded
+        super.init(
+            numInputs: numArguments + 2, numOutputs: 1, firstVariadicInput: 2,
+            attributes: [.isMutable, .isVariadic, .isCall])
+    }
+
+    func withGuardedState(_ isGuarded: Bool) -> GuardableOperation {
+        return CallComputedMethodWithSpread(
+            numArguments: numArguments, spreads: spreads, isGuarded: isGuarded)
+    }
+}
+
+public enum UnaryOperator: String, CaseIterable {
+    case PreInc = "++"
+    case PreDec = "--"
+    case PostInc = "++ "  // Raw value must be unique
+    case PostDec = "-- "  // Raw value must be unique
+    case LogicalNot = "!"
+    case BitwiseNot = "~"
+    case Plus = "+"
+    case Minus = "-"
+
+    var token: String {
+        return self.rawValue.trimmingCharacters(in: [" "])
+    }
+
+    var reassignsInput: Bool {
+        return self == .PreInc || self == .PreDec || self == .PostInc || self == .PostDec
+    }
+
+    var isPostfix: Bool {
+        return self == .PostInc || self == .PostDec
+    }
+}
+
+final class UnaryOperation: JsOperation {
+    override var opcode: Opcode { .unaryOperation(self) }
+
+    let op: UnaryOperator
+
+    init(_ op: UnaryOperator) {
+        self.op = op
+        super.init(numInputs: 1, numOutputs: 1, attributes: .isMutable)
+    }
+}
+
+public enum BinaryOperator: String, CaseIterable {
+    case Add = "+"
+    case Sub = "-"
+    case Mul = "*"
+    case Div = "/"
+    case Mod = "%"
+    case BitAnd = "&"
+    case BitOr = "|"
+    case LogicAnd = "&&"
+    case LogicOr = "||"
+    case Xor = "^"
+    case LShift = "<<"
+    case RShift = ">>"
+    case Exp = "**"
+    case UnRShift = ">>>"
+    // Nullish coalescing operator (??)
+    case NullCoalesce = "??"
+
+    var token: String {
+        return self.rawValue
+    }
+}
+
+final class BinaryOperation: JsOperation {
+    override var opcode: Opcode { .binaryOperation(self) }
+
+    let op: BinaryOperator
+
+    init(_ op: BinaryOperator) {
+        self.op = op
+        super.init(numInputs: 2, numOutputs: 1, attributes: .isMutable)
+    }
+}
+
+/// Ternary operator: a ? b : c.
+final class TernaryOperation: JsOperation {
+    override var opcode: Opcode { .ternaryOperation(self) }
+
+    init() {
+        super.init(numInputs: 3, numOutputs: 1)
+    }
+}
+
+/// Reassigns an existing variable, essentially doing `input1 = input2;`
+final class Reassign: JsOperation {
+    override var opcode: Opcode { .reassign(self) }
+
+    init() {
+        super.init(numInputs: 2)
+    }
+}
+
+/// Updates a variable by applying a binary operation to it and another variable.
+final class Update: JsOperation {
+    override var opcode: Opcode { .update(self) }
+
+    let op: BinaryOperator
+
+    init(_ op: BinaryOperator) {
+        self.op = op
+        super.init(numInputs: 2)
+    }
+}
+
+/// Duplicates a variable, essentially doing `output = input;`
+final class Dup: JsOperation {
+    override var opcode: Opcode { .dup(self) }
+
+    init() {
+        super.init(numInputs: 1, numOutputs: 1)
+    }
+}
+
+// This array must be kept in sync with the Comparator Enum in operations.proto
+public enum Comparator: String, CaseIterable {
+    case equal = "=="
+    case strictEqual = "==="
+    case notEqual = "!="
+    case strictNotEqual = "!=="
+    case lessThan = "<"
+    case lessThanOrEqual = "<="
+    case greaterThan = ">"
+    case greaterThanOrEqual = ">="
+
+    var token: String {
+        return self.rawValue
+    }
+}
+
+final class Compare: JsOperation {
+    override var opcode: Opcode { .compare(self) }
+
+    let op: Comparator
+
+    init(_ comparator: Comparator) {
+        self.op = comparator
+        super.init(numInputs: 2, numOutputs: 1, attributes: .isMutable)
+    }
+}
+
+/// An operation that will be lifted to a given string. The string can use %@ placeholders which
+/// will be replaced by the expressions for the input variables during lifting.
+final class Eval: JsOperation {
+    override var opcode: Opcode { .eval(self) }
+
+    let code: String
+
+    var hasOutput: Bool {
+        assert(numOutputs == 0 || numOutputs == 1)
+        return numOutputs == 1
+    }
+
+    init(_ string: String, numArguments: Int, hasOutput: Bool) {
+        self.code = string
+        super.init(
+            numInputs: numArguments, numOutputs: hasOutput ? 1 : 0,
+            attributes: Self.attributes(for: string))
+    }
+
+    /// Natives whose inputs must be JSFunctions. The InputMutator must not
+    /// replace these inputs: substituting a random non-function (Symbol,
+    /// object, number, ...) breaks the %Prepare/%Optimize protocol, causing
+    /// CHECK crashes in non-fuzzing builds (false-positive "crashes" when
+    /// verifying the corpus) and silently wasting the tier-up coverage in
+    /// fuzzing builds (the runtime casts the non-function to a JSFunction
+    /// and reads garbage fields).
+    private static func attributes(for code: String) -> Operation.Attributes {
+        let functionInputNatives = [
+            "%PrepareFunctionForOptimization",
+            "%OptimizeFunctionOnNextCall",
+            "%OptimizeMaglevOnNextCall",
+            "%DeoptimizeFunction",
+            "%NeverOptimizeFunction",
+            "%DeoptimizeNow",
+            "%GetBytecode",
+            "%InstallBytecode",
+            "%WasmTierUpFunction",
+        ]
+        if functionInputNatives.contains(where: { code.hasPrefix($0) }) {
+            return .isNotInputMutable
+        }
+        return []
+    }
+}
+
+final class BeginWith: JsOperation {
+    override var opcode: Opcode { .beginWith(self) }
+
+    init() {
+        super.init(
+            numInputs: 1, attributes: [.isBlockStart, .propagatesSurroundingContext],
+            contextOpened: [.javascript])
+    }
+}
+
+final class EndWith: JsOperation {
+    override var opcode: Opcode { .endWith(self) }
+
+    init() {
+        super.init(attributes: [.isBlockEnd])
+    }
+}
+
+final class CallSuperConstructor: JsOperation {
+    override var opcode: Opcode { .callSuperConstructor(self) }
+
+    var numArguments: Int {
+        return numInputs
+    }
+
+    init(numArguments: Int) {
+        super.init(
+            numInputs: numArguments, firstVariadicInput: 0, attributes: [.isVariadic, .isCall],
+            requiredContext: [.javascript, .method])
+    }
+}
+
+final class CallSuperMethod: JsOperation {
+    override var opcode: Opcode { .callSuperMethod(self) }
+
+    let methodName: String
+
+    var numArguments: Int {
+        return numInputs
+    }
+
+    init(methodName: String, numArguments: Int) {
+        self.methodName = methodName
+        super.init(
+            numInputs: numArguments, numOutputs: 1, firstVariadicInput: 0,
+            attributes: [.isCall, .isMutable, .isVariadic], requiredContext: [.javascript, .method])
+    }
+}
+
+final class GetPrivateProperty: JsOperation, GuardableOperation {
+    override var opcode: Opcode { .getPrivateProperty(self) }
+
+    let isGuarded: Bool
+
+    let propertyName: String
+
+    init(propertyName: String, isGuarded: Bool) {
+        self.propertyName = propertyName
+        // Accessing a private property that isn't declared in the surrounding class definition is a syntax error
+        // (and so cannot even be handled with a try-catch). Since mutating private property names would often
+        // result in an access to such an undefined private property, and therefore a syntax error, we do not mutate them.
+        self.isGuarded = isGuarded
+        super.init(
+            numInputs: 1, numOutputs: 1,
+            requiredContext: [.javascript, .classMethod])
+    }
+
+    func withGuardedState(_ isGuarded: Bool) -> GuardableOperation {
+        return GetPrivateProperty(propertyName: propertyName, isGuarded: isGuarded)
+    }
+}
+
+final class SetPrivateProperty: JsOperation, GuardableOperation {
+    override var opcode: Opcode { .setPrivateProperty(self) }
+
+    let isGuarded: Bool
+
+    let propertyName: String
+
+    init(propertyName: String, isGuarded: Bool) {
+        self.propertyName = propertyName
+        // See comment in GetPrivateProperty for why these aren't mutable.
+        self.isGuarded = isGuarded
+        super.init(
+            numInputs: 2, requiredContext: [.javascript, .classMethod])
+    }
+
+    func withGuardedState(_ isGuarded: Bool) -> GuardableOperation {
+        return SetPrivateProperty(propertyName: propertyName, isGuarded: isGuarded)
+    }
+}
+
+final class UpdatePrivateProperty: JsOperation {
+    override var opcode: Opcode { .updatePrivateProperty(self) }
+
+    let propertyName: String
+    let op: BinaryOperator
+
+    init(propertyName: String, operator op: BinaryOperator) {
+        self.propertyName = propertyName
+        self.op = op
+        // See comment in GetPrivateProperty for why these aren't mutable.
+        super.init(numInputs: 2, requiredContext: [.javascript, .classMethod])
+    }
+}
+
+final class CallPrivateMethod: JsOperation, GuardableOperation {
+    override var opcode: Opcode { .callPrivateMethod(self) }
+
+    let isGuarded: Bool
+
+    let methodName: String
+
+    var numArguments: Int {
+        return numInputs - 1
+    }
+
+    init(methodName: String, numArguments: Int, isGuarded: Bool) {
+        self.methodName = methodName
+        // The reference object is the first input.
+        // See comment in GetPrivateProperty for why these aren't mutable.
+        self.isGuarded = isGuarded
+        super.init(
+            numInputs: numArguments + 1, numOutputs: 1, firstVariadicInput: 1,
+            attributes: [.isVariadic, .isCall], requiredContext: [.javascript, .classMethod])
+    }
+
+    func withGuardedState(_ isGuarded: Bool) -> GuardableOperation {
+        return CallPrivateMethod(
+            methodName: methodName, numArguments: numArguments, isGuarded: isGuarded)
+    }
+}
+
+final class CallPrivateMethodWithSpread: JsOperation, GuardableOperation {
+    override var opcode: Opcode { .callPrivateMethodWithSpread(self) }
+
+    let isGuarded: Bool
+
+    let methodName: String
+    let spreads: [Bool]
+
+    var numArguments: Int {
+        return numInputs - 1
+    }
+
+    init(methodName: String, numArguments: Int, spreads: [Bool], isGuarded: Bool) {
+        assert(spreads.count == numArguments)
+        self.methodName = methodName
+        self.spreads = spreads
+        self.isGuarded = isGuarded
+        super.init(
+            numInputs: numArguments + 1, numOutputs: 1, firstVariadicInput: 1,
+            attributes: [.isVariadic, .isCall], requiredContext: [.javascript, .classMethod])
+    }
+
+    func withGuardedState(_ isGuarded: Bool) -> GuardableOperation {
+        return CallPrivateMethodWithSpread(
+            methodName: methodName, numArguments: numArguments, spreads: spreads,
+            isGuarded: isGuarded)
+    }
+}
+
+final class GetSuperProperty: JsOperation {
+    override var opcode: Opcode { .getSuperProperty(self) }
+
+    let propertyName: String
+
+    init(propertyName: String) {
+        self.propertyName = propertyName
+        super.init(numOutputs: 1, attributes: .isMutable, requiredContext: [.javascript, .method])
+    }
+}
+
+final class SetSuperProperty: JsOperation {
+    override var opcode: Opcode { .setSuperProperty(self) }
+
+    let propertyName: String
+
+    init(propertyName: String) {
+        self.propertyName = propertyName
+        super.init(numInputs: 1, attributes: .isMutable, requiredContext: [.javascript, .method])
+    }
+}
+
+final class SetComputedSuperProperty: JsOperation {
+    override var opcode: Opcode { .setComputedSuperProperty(self) }
+
+    init() {
+        super.init(numInputs: 2, requiredContext: [.javascript, .method])
+    }
+}
+
+final class GetComputedSuperProperty: JsOperation {
+    override var opcode: Opcode { .getComputedSuperProperty(self) }
+
+    init() {
+        super.init(numInputs: 1, numOutputs: 1, requiredContext: [.javascript, .method])
+    }
+}
+
+final class UpdateSuperProperty: JsOperation {
+    override var opcode: Opcode { .updateSuperProperty(self) }
+
+    let propertyName: String
+    let op: BinaryOperator
+
+    init(propertyName: String, operator op: BinaryOperator) {
+        self.propertyName = propertyName
+        self.op = op
+        super.init(numInputs: 1, attributes: .isMutable, requiredContext: [.javascript, .method])
+    }
+}
+
+final class BeginIf: JsOperation {
+    override var opcode: Opcode { .beginIf(self) }
+
+    // If true, the condition for this if block will be negated.
+    let inverted: Bool
+
+    init(inverted: Bool) {
+        self.inverted = inverted
+        super.init(
+            numInputs: 1,
+            numInnerOutputs: 1,
+            attributes: [.isBlockStart, .isMutable, .propagatesSurroundingContext],
+            contextOpened: .javascript)
+    }
+}
+
+final class BeginElse: JsOperation {
+    override var opcode: Opcode { .beginElse(self) }
+
+    init() {
+        super.init(
+            numInnerOutputs: 1,
+            attributes: [.isBlockEnd, .isBlockStart, .propagatesSurroundingContext],
+            contextOpened: .javascript)
+    }
+}
+
+final class EndIf: JsOperation {
+    override var opcode: Opcode { .endIf(self) }
+
+    init() {
+        super.init(attributes: .isBlockEnd)
+    }
+}
+
+///
+/// Loops.
+///
+/// Loops in FuzzIL generally have the following format:
+///
+///     BeginLoopHeader
+///        v7 <- Compare v1, v2, '<'
+///     BeginLoopBody <- v7
+///        ...
+///     EndLoop
+///
+/// Which would be lifted to something like
+///
+///     loop(v1 < v2) {
+///       // body
+///     }
+///
+/// As such, it is possible to perform arbitrary computations in the loop header, as it is in JavaScript.
+/// JavaScript only allows a single expression inside a loop header. However, this is purely a syntactical
+/// restriction, and can be overcome for example by declaring and invoking an arrow function in the
+/// header if necessary:
+///
+///     BeginLoopHeader
+///         foo
+///     BeginLoopBody
+///         ...
+///     EndLoopBody
+///
+/// Can be lifted to
+///
+///     loop((() => { foo })()) {
+///         // body
+///     }
+///
+/// For simpler cases that only involve expressions, the header can also be lifted to
+///
+///     loop(foo(), bar(), baz()) {
+///         // body
+///     }
+///
+
+final class BeginWhileLoopHeader: JsOperation {
+    override var opcode: Opcode { .beginWhileLoopHeader(self) }
+
+    init() {
+        super.init(
+            attributes: [.isBlockStart, .propagatesSurroundingContext], contextOpened: .javascript)
+    }
+}
+
+// The input is the loop condition. This also prevents empty loop headers which are forbidden by the language.
+// The innerOutput is the label of the loop.
+final class BeginWhileLoopBody: JsOperation {
+    override var opcode: Opcode { .beginWhileLoopBody(self) }
+
+    init() {
+        super.init(
+            numInputs: 1, numInnerOutputs: 1,
+            attributes: [.isBlockStart, .isBlockEnd, .propagatesSurroundingContext],
+            contextOpened: [.javascript, .loop])
+    }
+}
+
+final class EndWhileLoop: JsOperation {
+    override var opcode: Opcode { .endWhileLoop(self) }
+
+    init() {
+        super.init(attributes: .isBlockEnd)
+    }
+}
+
+// The innerOutput is the label of the loop.
+final class BeginDoWhileLoopBody: JsOperation {
+    override var opcode: Opcode { .beginDoWhileLoopBody(self) }
+
+    init() {
+        super.init(
+            numInnerOutputs: 1,
+            attributes: [.isBlockStart, .propagatesSurroundingContext],
+            contextOpened: [.javascript, .loop])
+    }
+}
+
+final class BeginDoWhileLoopHeader: JsOperation {
+    override var opcode: Opcode { .beginDoWhileLoopHeader(self) }
+
+    init() {
+        super.init(
+            attributes: [.isBlockStart, .isBlockEnd, .propagatesSurroundingContext],
+            contextOpened: .javascript)
+    }
+}
+
+// The input is the loop condition. This also prevents empty loop headers which are forbidden by the language.
+final class EndDoWhileLoop: JsOperation {
+    override var opcode: Opcode { .endDoWhileLoop(self) }
+
+    init() {
+        super.init(numInputs: 1, attributes: .isBlockEnd)
+    }
+}
+
+///
+/// For loops.
+///
+/// For loops have the following shape:
+///
+///     BeginForLoopInitializer
+///         // ...
+///         // v0 = initial value of the (single) loop variable
+///     BeginForLoopCondition v0 -> v1
+///         // v1 = current value of the (single) loop variable
+///         // ...
+///     BeginForLoopAfterthought -> v2
+///         // v2 = current value of the (single) loop variable
+///         // ...
+///     BeginForLoopBody -> v3
+///         // v3 = current value of the (single) loop variable
+///         // ...
+///     EndForLoop
+///
+/// This would be lifted to:
+///
+///     for (let vX = init; cond; afterthought) {
+///         body
+///     }
+///
+/// This format allows arbitrary computations to be performed in every part of the loop header. It also
+/// allows zero, one, or multiple loop variables to be declared, which correspond to the inner outputs
+/// of the blocks. During lifting, all the inner outputs are expected to lift to the same identifier (vX in
+/// the example above).
+/// Similar to while- and do-while loops, the code in the header blocks may be lifted to arrow functions
+/// if it requires more than one expression.
+///
+final class BeginForLoopInitializer: JsOperation {
+    override var opcode: Opcode { .beginForLoopInitializer(self) }
+
+    init() {
+        super.init(
+            attributes: [.isBlockStart, .propagatesSurroundingContext], contextOpened: .javascript)
+    }
+}
+
+final class BeginForLoopCondition: JsOperation {
+    override var opcode: Opcode { .beginForLoopCondition(self) }
+
+    var numLoopVariables: Int {
+        return numInnerOutputs
+    }
+
+    init(numLoopVariables: Int) {
+        super.init(
+            numInputs: numLoopVariables, numInnerOutputs: numLoopVariables,
+            attributes: [.isBlockStart, .isBlockEnd, .propagatesSurroundingContext],
+            contextOpened: .javascript)
+    }
+}
+
+final class BeginForLoopAfterthought: JsOperation {
+    override var opcode: Opcode { .beginForLoopAfterthought(self) }
+
+    var numLoopVariables: Int {
+        return numInnerOutputs
+    }
+
+    init(numLoopVariables: Int) {
+        super.init(
+            numInputs: 1, numInnerOutputs: numLoopVariables,
+            attributes: [.isBlockStart, .isBlockEnd, .propagatesSurroundingContext],
+            contextOpened: .javascript)
+    }
+}
+
+// Note: The last innerOutput is the label of the loop.
+final class BeginForLoopBody: JsOperation {
+    override var opcode: Opcode { .beginForLoopBody(self) }
+
+    var numLoopVariables: Int {
+        return numInnerOutputs - 1
+    }
+
+    init(numLoopVariables: Int) {
+        super.init(
+            numInnerOutputs: numLoopVariables + 1,
+            attributes: [.isBlockStart, .isBlockEnd, .propagatesSurroundingContext],
+            contextOpened: [.javascript, .loop])
+    }
+}
+
+final class EndForLoop: JsOperation {
+    override var opcode: Opcode { .endForLoop(self) }
+
+    init() {
+        super.init(attributes: .isBlockEnd)
+    }
+}
+
+public enum ForInOfLoopType: CaseIterable {
+    case forOf
+    case forIn
+}
+
+public enum UsingType: String, Hashable, CaseIterable {
+    case none = ""
+    case using = "using"
+    case awaitUsing = "await using"
+}
+
+// Note: The last innerOutput is the label of the loop.
+public enum LoopHeader: Hashable {
+    case simple
+    case destruct(pattern: DestructuringPattern)
+
+    // Legacy helper methods to allow tests to use the old concise syntax
+    public static func arrayDestruct(indices: [Int64], hasRestElement: Bool) -> LoopHeader {
+        var elements = [DestructuringPattern.ArrayElement]()
+        var elementIndices = indices
+        if hasRestElement && !elementIndices.isEmpty {
+            elementIndices.removeLast()
+        }
+
+        // In the old format, the rest element's index dictated how many elements came before it.
+        let maxIndex =
+            hasRestElement && !indices.isEmpty
+            ? Int(indices.last!) - 1 : Int(elementIndices.max() ?? -1)
+
+        if maxIndex >= 0 {
+            for i in 0...maxIndex {
+                if elementIndices.contains(Int64(i)) {
+                    elements.append(
+                        DestructuringPattern.ArrayElement(
+                            target: .flatBinding))
+                } else {
+                    elements.append(
+                        DestructuringPattern.ArrayElement(
+                            target: nil))
+                }
+            }
+        }
+        return .destruct(
+            pattern: .array(
+                DestructuringPattern.ArrayPattern(
+                    elements: elements, restTarget: hasRestElement ? .flatBinding : .none))
+        )
+    }
+
+    public static func objectDestruct(properties: [String], hasRestElement: Bool) -> LoopHeader {
+        let props = properties.map {
+            DestructuringPattern.ObjectProperty(
+                key: .string($0), target: .flatBinding)
+        }
+        return .destruct(
+            pattern: .object(
+                DestructuringPattern.ObjectPattern(
+                    properties: props, hasRestElement: hasRestElement)))
+    }
+}
+
+final class ForLoop: JsOperation {
+    let header: LoopHeader
+    let isAsync: Bool
+    let type: ForInOfLoopType
+    let usingType: UsingType
+    public var isForIn: Bool { return type == .forIn }
+
+    init(
+        type: ForInOfLoopType, isAsync: Bool = false,
+        usingType: UsingType = .none, header: LoopHeader = .simple,
+        patternInputs: Int = 0
+    ) {
+        self.header = header
+        self.isAsync = isAsync
+        self.type = type
+        self.usingType = usingType
+
+        assert(usingType == .none || header == .simple, "using declarations cannot be destructured")
+
+        if type == .forIn {
+            assert(!isAsync, "For-in loops cannot be async")
+            assert(header == .simple, "For-in loops cannot have destructuring headers")
+            assert(usingType == .none, "For-in loops cannot use using")
+        }
+
+        let numInnerOutputs: Int
+
+        switch header {
+        case .simple:
+            numInnerOutputs = 2
+
+        case .destruct(let pattern):
+            numInnerOutputs = pattern.numBindings + 1  // loop label is appended
+        }
+
+        super.init(
+            numInputs: 1 + patternInputs, numInnerOutputs: numInnerOutputs,
+            attributes: [.isBlockStart, .propagatesSurroundingContext],
+            requiredContext: isAsync ? [.javascript, .async] : [.javascript],
+            contextOpened: [.loop])
+    }
+
+    var pattern: DestructuringPattern {
+        if case .destruct(let pattern) = self.header { return pattern }
+        preconditionFailure("Invalid header for ForLoop pattern")
+    }
+
+    override var opcode: Opcode {
+        return .beginForLoop(self)
+    }
+}
+
+// A loop that simply runs N times and is therefore always guaranteed to terminate.
+// Useful for example to force JIT compilation without creating more complex loops, which can often quickly end up turning into infinite loops due to mutations.
+// These could be lifted simply as `for (let i = 0; i < N; i++) { body() }`
+// Note: The last innerOutput is the label of the loop.
+final class BeginRepeatLoop: JsOperation {
+    override var opcode: Opcode { .beginRepeatLoop(self) }
+
+    let iterations: Int
+
+    // Whether the current iteration number is exposed as an inner output variable.
+    var exposesLoopCounter: Bool {
+        return numInnerOutputs == 2
+    }
+
+    init(iterations: Int, exposesLoopCounter: Bool = true) {
+        self.iterations = iterations
+        super.init(
+            numInnerOutputs: exposesLoopCounter ? 2 : 1,
+            attributes: [.isBlockStart, .propagatesSurroundingContext],
+            contextOpened: [.javascript, .loop])
+    }
+}
+
+final class EndRepeatLoop: JsOperation {
+    override var opcode: Opcode { .endRepeatLoop(self) }
+
+    init() {
+        super.init(attributes: .isBlockEnd)
+    }
+}
+
+final class LoopBreak: JsOperation {
+    override var opcode: Opcode { .loopBreak(self) }
+
+    init(hasLabel: Bool = false) {
+        super.init(
+            numInputs: hasLabel ? 1 : 0, attributes: [.isJump, .isNotInputMutable],
+            requiredContext: [.javascript, .loop])
+    }
+}
+
+final class LoopContinue: JsOperation {
+    override var opcode: Opcode { .loopContinue(self) }
+
+    init(hasLabel: Bool = false) {
+        super.init(
+            numInputs: hasLabel ? 1 : 0, attributes: [.isJump, .isNotInputMutable],
+            requiredContext: [.javascript, .loop])
+    }
+}
+
+final class BeginTry: JsOperation {
+    override var opcode: Opcode { .beginTry(self) }
+
+    init() {
+        super.init(attributes: [.isBlockStart, .propagatesSurroundingContext])
+    }
+}
+
+final class BeginCatch: JsOperation {
+    override var opcode: Opcode { .beginCatch(self) }
+
+    init() {
+        super.init(
+            numInnerOutputs: 1,
+            attributes: [.isBlockStart, .isBlockEnd, .propagatesSurroundingContext])
+    }
+}
+
+final class BeginFinally: JsOperation {
+    override var opcode: Opcode { .beginFinally(self) }
+
+    init() {
+        super.init(attributes: [.isBlockStart, .isBlockEnd, .propagatesSurroundingContext])
+    }
+}
+
+final class EndTryCatchFinally: JsOperation {
+    override var opcode: Opcode { .endTryCatchFinally(self) }
+
+    init() {
+        super.init(attributes: [.isBlockEnd])
+    }
+}
+
+final class ThrowException: JsOperation {
+    override var opcode: Opcode { .throwException(self) }
+
+    init() {
+        super.init(numInputs: 1, attributes: [.isJump])
+    }
+}
+
+/// Generates a block of instructions, which is lifted to a string literal, that is a suitable as an argument to eval()
+final class BeginCodeString: JsOperation {
+    override var opcode: Opcode { .beginCodeString(self) }
+
+    init() {
+        super.init(numOutputs: 1, attributes: [.isBlockStart], contextOpened: .javascript)
+    }
+}
+
+final class EndCodeString: JsOperation {
+    override var opcode: Opcode { .endCodeString(self) }
+
+    init() {
+        super.init(attributes: [.isBlockEnd])
+    }
+}
+
+/// Generates a block of instructions, which is lifted to a block statement.
+final class BeginBlockStatement: JsOperation {
+    override var opcode: Opcode { .beginBlockStatement(self) }
+
+    init() {
+        super.init(
+            numInnerOutputs: 1,
+            attributes: [.isBlockStart, .propagatesSurroundingContext],
+            contextOpened: [.javascript])
+    }
+}
+
+final class EndBlockStatement: JsOperation {
+    override var opcode: Opcode { .endBlockStatement(self) }
+
+    init() {
+        super.init(attributes: [.isBlockEnd])
+    }
+}
+
+final class BlockBreak: JsOperation {
+    override var opcode: Opcode { .blockBreak(self) }
+
+    // Block break statements always need to reference a label. "break;" is not allowed here.
+    init() {
+        super.init(
+            numInputs: 1, attributes: [.isJump, .isNotInputMutable],
+            requiredContext: [.javascript])
+    }
+}
+
+///
+/// Switch-Cases
+///
+/// (1) Represent switch-case as a single block group, started by a BeginSwitch
+///     and with each case started by a BeginSwitchCase:
+///
+///         BeginSwitch
+///             // instructions of the first case
+///         BeginSwitchCase
+///             // instructions of the second case
+///         BeginSwitchCase
+///             // instructions of the third case
+///         BeginSwitchDefaultCase
+///             // instructions of the default case
+///         ...
+///         EndSwitch
+///
+///     The main issue with this design is that it makes it hard to add new
+///     cases through splicing or code generation add new BeginSwitchCase
+///     instructions into this program as this would 'cut' an existing
+///     BeginSwitchCase sub-block into two halves, producing invalid code. Due
+///     to that limitation, the minimizer is then also unable to minize these
+///     BeginSwitchCase blocks as this would violate the "any feature removed
+///     by the minimizer can be added back by a mutator" invariant. The result
+///     is static switch blocks that are never mutated and often nedlessly keep
+///     many other variables alive.
+///
+/// (2) Represent switch-case as a switch block with sub-blocks for the cases:
+///
+///         BeginSwitch
+///             BeginSwitchCase
+///                // instructions of the first case
+///             EndSwitchCase
+///             BeginSwitchCase
+///                // instructions of the second case
+///             EndSwitchCase
+///             BeginSwitchCase
+///                 // instructions of the third case
+///             EndSwitchCase
+///             BeginSwitchDefaultCase
+///                 // instructions of the default case
+///             EndSwitchCase
+///             ...
+///         EndSwitch
+///
+///     Inside the BeginSwitch, there is a .switchBlock but no .script context
+///     and so only BeginSwitchCase and EndSwitchCase can be placed there. This
+///     then trivially allows adding new cases from code generation or splicing,
+///     in turn allowing proper minimization of switch-case blocks.
+///
+final class BeginSwitch: JsOperation {
+    override var opcode: Opcode { .beginSwitch(self) }
+
+    init() {
+        super.init(
+            numInputs: 1,
+            numInnerOutputs: 1,
+            attributes: [.isBlockStart],
+            contextOpened: [.switchBlock])
+    }
+}
+
+final class BeginSwitchCase: JsOperation {
+    override var opcode: Opcode { .beginSwitchCase(self) }
+
+    init() {
+        super.init(
+            numInputs: 1, attributes: [.isBlockStart, .resumesSurroundingContext],
+            requiredContext: .switchBlock, contextOpened: [.switchCase, .javascript])
+    }
+}
+
+/// This is the default case, it has no inputs, this is always in a BeginSwitch/EndSwitch block group.
+/// We currently do not minimize this away. It is expected for other minimizers to reduce the contents of this block,
+/// such that, if necessary, the BeginSwitch/EndSwitch reducer can remove the whole switch case altogether.
+final class BeginSwitchDefaultCase: JsOperation {
+    override var opcode: Opcode { .beginSwitchDefaultCase(self) }
+
+    init() {
+        super.init(
+            attributes: [.isBlockStart, .resumesSurroundingContext, .isSingular],
+            requiredContext: .switchBlock, contextOpened: [.switchCase, .javascript])
+    }
+}
+
+/// This ends BeginSwitchCase and BeginDefaultSwitchCase blocks.
+final class EndSwitchCase: JsOperation {
+    override var opcode: Opcode { .endSwitchCase(self) }
+
+    /// If true, causes this case to fall through (and so no "break;" is emitted by the Lifter)
+    let fallsThrough: Bool
+
+    init(fallsThrough: Bool) {
+        self.fallsThrough = fallsThrough
+        super.init(attributes: .isBlockEnd)
+    }
+}
+
+final class EndSwitch: JsOperation {
+    override var opcode: Opcode { .endSwitch(self) }
+
+    init() {
+        super.init(attributes: .isBlockEnd, requiredContext: .switchBlock)
+    }
+}
+
+final class SwitchBreak: JsOperation {
+    override var opcode: Opcode { .switchBreak(self) }
+
+    init() {
+        super.init(attributes: .isJump, requiredContext: [.javascript, .switchCase])
+    }
+}
+
+final class LoadNewTarget: JsOperation {
+    override var opcode: Opcode { .loadNewTarget(self) }
+
+    init() {
+        super.init(numOutputs: 1, requiredContext: .subroutine)
+    }
+}
+
+final class BeginBundleScript: JsOperation {
+    override var opcode: Opcode { .beginBundleScript(self) }
+
+    init() {
+        super.init(
+            attributes: .isBlockStart, requiredContext: [.bundle], contextOpened: .javascript)
+    }
+}
+
+final class EndBundleScript: JsOperation {
+    override var opcode: Opcode { .endBundleScript(self) }
+
+    init() {
+        super.init(attributes: .isBlockEnd, requiredContext: .javascript)
+    }
+}
+
+final class BeginWasmModule: JsOperation {
+    override var opcode: Opcode { .beginWasmModule(self) }
+    init() {
+        super.init(
+            numOutputs: 0, attributes: [.isBlockStart], requiredContext: [.javascript],
+            contextOpened: [.wasm])
+    }
+}
+
+// The output of this instruction will be the compiled wasm module, i.e. the `instance` field will have the methods.
+class EndWasmModule: JsOperation {
+    override var opcode: Opcode { .endWasmModule(self) }
+
+    var hasStartFunction: Bool {
+        return numInputs == 1
+    }
+
+    init(hasStartFunction: Bool = false) {
+        super.init(
+            numInputs: hasStartFunction ? 1 : 0, numOutputs: 1,
+            attributes: [.isBlockEnd, .isMutable], requiredContext: [.wasm])
+    }
+}
+
+class WrapPromising: JsOperation {
+    override var opcode: Opcode { .wrapPromising(self) }
+
+    init() {
+        super.init(numInputs: 1, numOutputs: 1, requiredContext: .javascript)
+    }
+}
+
+class WrapSuspending: JsOperation {
+    override var opcode: Opcode { .wrapSuspending(self) }
+
+    init() {
+        super.init(numInputs: 1, numOutputs: 1, requiredContext: .javascript)
+    }
+}
+
+// This is used to bind methods for use as utility functions.
+// https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Function/bind#transforming_methods_to_utility_functions
+// This allows us to call these things from Wasm and V8 has optimizations to help with well-known imports.
+class BindMethod: JsOperation {
+    override var opcode: Opcode { .bindMethod(self) }
+
+    let methodName: String
+
+    init(methodName: String) {
+        self.methodName = methodName
+        // TODO(cffsmith): We probably want to expand this in the future to also bind arguments at some point.
+        super.init(numInputs: 1, numOutputs: 1, requiredContext: .javascript)
+    }
+}
+
+class BindFunction: JsOperation {
+    override var opcode: Opcode { .bindFunction(self) }
+
+    init(numInputs: Int) {
+        super.init(
+            numInputs: numInputs, numOutputs: 1, firstVariadicInput: 1,
+            attributes: [.isVariadic], requiredContext: .javascript)
+    }
+}
+
+// This instruction is used to create strongly typed WasmGlobals in the JS world that can be imported by a WasmModule.
+class CreateWasmGlobal: JsOperation {
+    override var opcode: Opcode { .createWasmGlobal(self) }
+
+    let value: WasmGlobal
+    let isMutable: Bool
+
+    init(value: WasmGlobal, isMutable: Bool) {
+        self.value = value
+        self.isMutable = isMutable
+        super.init(numOutputs: 1, attributes: [.isMutable], requiredContext: [.javascript])
+    }
+}
+
+// This instruction is used to create strongly typed WasmMemories in the JS world that can be imported by a WasmModule.
+class CreateWasmMemory: JsOperation {
+    override var opcode: Opcode { .createWasmMemory(self) }
+
+    let memType: WasmMemoryType
+
+    init(limits: Limits, isShared: Bool = false, isMemory64: Bool = false) {
+        self.memType = WasmMemoryType(limits: limits, isShared: isShared, isMemory64: isMemory64)
+        super.init(numOutputs: 1, attributes: [.isMutable], requiredContext: [.javascript])
+    }
+}
+
+// This instruction is used to create strongly typed WasmTables in the JS world that can be imported by a WasmModule.
+class CreateWasmTable: JsOperation {
+    override var opcode: Opcode { .createWasmTable(self) }
+
+    // We need to store the element type here such that the lifter can easily list the correct type 'externref' or 'anyfunc' when constructing.
+    let tableType: WasmTableType
+
+    init(elementType: ILType, limits: Limits, isTable64: Bool) {
+        self.tableType = WasmTableType(
+            elementType: elementType, limits: limits, isTable64: isTable64, knownEntrySignatures: []
+        )
+        super.init(numOutputs: 1, attributes: [.isMutable], requiredContext: [.javascript])
+    }
+}
+
+class CreateWasmJSTag: JsOperation {
+    override var opcode: Opcode { .createWasmJSTag(self) }
+
+    init() {
+        super.init(numOutputs: 1, requiredContext: [.javascript])
+    }
+}
+
+class CreateWasmTag: JsOperation {
+    override var opcode: Opcode { .createWasmTag(self) }
+    public let parameterTypes: [ILType]
+
+    init(parameterTypes: [ILType]) {
+        self.parameterTypes = parameterTypes
+        super.init(numOutputs: 1, attributes: [], requiredContext: [.javascript])
+    }
+}
+
+class WasmTypeOperation: Operation {}
+
+class WasmBeginTypeGroup: WasmTypeOperation {
+    override var opcode: Opcode { .wasmBeginTypeGroup(self) }
+    init() {
+        super.init(
+            attributes: [.isBlockStart], requiredContext: [.javascript],
+            contextOpened: [.wasmTypeGroup])
+    }
+}
+
+class WasmEndTypeGroup: WasmTypeOperation {
+    override var opcode: Opcode { .wasmEndTypeGroup(self) }
+    var typesCount: Int {
+        return numInputs
+    }
+
+    init(typesCount: Int) {
+        super.init(
+            numInputs: typesCount, numOutputs: typesCount, firstVariadicInput: 0,
+            attributes: [.isBlockEnd, .isVariadic, .isNotInputMutable],
+            requiredContext: [.wasmTypeGroup])
+    }
+}
+
+class WasmDefineArrayType: WasmTypeOperation {
+    override var opcode: Opcode { .wasmDefineArrayType(self) }
+    let elementType: ILType
+    let mutability: Bool
+    let hasSuperType: Bool
+    let isFinal: Bool
+
+    init(elementType: ILType, mutability: Bool, hasSuperType: Bool = false, isFinal: Bool = false) {
+        self.elementType = elementType
+        self.mutability = mutability
+        self.hasSuperType = hasSuperType
+        self.isFinal = isFinal
+        let numInputs = (hasSuperType ? 1 : 0) + elementType.requiredInputCount()
+        super.init(
+            numInputs: numInputs, numOutputs: 1,
+            requiredContext: [.wasmTypeGroup])
+    }
+}
+
+class WasmDefineStructType: WasmTypeOperation {
+    override var opcode: Opcode { .wasmDefineStructType(self) }
+
+    typealias Field = WasmStructTypeDescription.Field
+
+    let fields: [Field]
+    let hasSuperType: Bool
+    let isFinal: Bool
+    let hasDescribes: Bool
+
+    init(
+        fields: [Field], hasSuperType: Bool = false, isFinal: Bool = false,
+        hasDescribes: Bool = false
+    ) {
+        self.fields = fields
+        self.hasSuperType = hasSuperType
+        self.isFinal = isFinal
+        self.hasDescribes = hasDescribes
+        let numInputs =
+            (hasSuperType ? 1 : 0) + (hasDescribes ? 1 : 0)
+            + fields.map {
+                $0.type.requiredInputCount()
+            }.reduce(0) { $0 + $1 }
+        super.init(
+            numInputs: numInputs, numOutputs: 1,
+            requiredContext: [.wasmTypeGroup])
+    }
+}
+
+class WasmDefineSignatureType: WasmTypeOperation {
+    override var opcode: Opcode { .wasmDefineSignatureType(self) }
+    let signature: WasmSignature
+    let hasSuperType: Bool
+    let isFinal: Bool
+
+    init(signature: WasmSignature, hasSuperType: Bool = false, isFinal: Bool = false) {
+        self.signature = signature
+        self.hasSuperType = hasSuperType
+        self.isFinal = isFinal
+        let numInputs =
+            (hasSuperType ? 1 : 0)
+            + (signature.outputTypes + signature.parameterTypes)
+            .map {
+                $0.requiredInputCount()
+            }.reduce(0) { $0 + $1 }
+        super.init(
+            numInputs: numInputs, numOutputs: 1,
+            requiredContext: [.wasmTypeGroup])
+    }
+}
+
+class WasmDefineForwardOrSelfReference: WasmTypeOperation {
+    override var opcode: Opcode { .wasmDefineForwardOrSelfReference(self) }
+
+    init() {
+        super.init(numInputs: 0, numOutputs: 1, requiredContext: [.wasmTypeGroup])
+    }
+}
+
+class WasmResolveForwardReference: WasmTypeOperation {
+    override var opcode: Opcode { .wasmResolveForwardReference(self) }
+
+    init() {
+        super.init(numInputs: 2, numOutputs: 0, requiredContext: [.wasmTypeGroup])
+    }
+}
+
+/// Internal operations.
+///
+/// These can be used for internal fuzzer operations but will not appear in the corpus.
+class JsInternalOperation: JsOperation {
+    init(numInputs: Int, numOutputs: Int = 0) {
+        super.init(numInputs: numInputs, numOutputs: numOutputs, attributes: [.isInternal])
+    }
+}
+
+/// Writes the argument to the output stream.
+final class Print: JsInternalOperation {
+    override var opcode: Opcode { .print(self) }
+
+    init() {
+        super.init(numInputs: 1)
+    }
+}
+
+/// Explore the input variable at runtime to determine which actions can be performed on it.
+/// Used by the ExplorationMutator.
+final class Explore: JsInternalOperation {
+    override var opcode: Opcode { .explore(self) }
+
+    let id: String
+    // This makes a single explore operation deterministic by seeding a JS RNG
+    let rngSeed: UInt32
+
+    init(id: String, numArguments: Int, rngSeed: UInt32) {
+        // IDs should be valid JavaScript property names since they will typically be used in that way.
+        assert(
+            id.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber) })
+                && id.contains(where: { $0.isLetter }))
+
+        self.id = id
+        self.rngSeed = rngSeed
+        super.init(numInputs: numArguments + 1)
+    }
+}
+
+/// Turn the input value into a probe that records the actions performed on it.
+/// Used by the ProbingMutator.
+final class Probe: JsInternalOperation {
+    override var opcode: Opcode { .probe(self) }
+
+    let id: String
+
+    init(id: String) {
+        // IDs should be valid JavaScript property names since they will typically be used in that way.
+        assert(
+            id.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber) })
+                && id.contains(where: { $0.isLetter }))
+
+        self.id = id
+        super.init(numInputs: 1)
+    }
+}
+
+/// Wraps an "action" (essentially another FuzzIL instruction) and, based on runtime information, attempts to make it "better".
+/// For example, this may remove unneeded guards (i.e. try-catch), or change the property/method accessed on an object if the original property/method doesn't exist.
+/// Used by the FixupMutator.
+final class Fixup: JsInternalOperation {
+    override var opcode: Opcode { .fixup(self) }
+
+    let id: String
+    // The JSON-encoded action performed and modified by this Fixup operation. See the FixupMutator and RuntimeAssistedMutator classes.
+    let action: String
+    // The name of the original FuzzIL operation (e.g. "GetComputedProperty") that this Fixup operation replaces. Currently only used for verification.
+    let originalOperation: String
+
+    var hasOutput: Bool {
+        assert(numOutputs == 0 || numOutputs == 1)
+        return numOutputs == 1
+    }
+
+    init(id: String, action: String, originalOperation: String, numArguments: Int, hasOutput: Bool)
+    {
+        self.id = id
+        self.action = action
+        self.originalOperation = originalOperation
+        super.init(numInputs: numArguments, numOutputs: hasOutput ? 1 : 0)
+    }
+}
+
+public struct WasmModuleMetadata: Hashable {
+    public struct FunctionExport: Hashable {
+        public let name: String
+        public let signature: Signature
+        public init(name: String, signature: Signature) {
+            self.name = name
+            self.signature = signature
+        }
+    }
+
+    public let functions: [FunctionExport]
+    public let globals: [String]
+    public let tables: [String]
+    public let tags: [String]
+    public let memories: [String]
+
+    public init(
+        functions: [FunctionExport] = [], globals: [String] = [], tables: [String] = [],
+        tags: [String] = [], memories: [String] = []
+    ) {
+        self.functions = functions
+        self.globals = globals
+        self.tables = tables
+        self.tags = tags
+        self.memories = memories
+    }
+}
+
+final class RawWasmModule: JsOperation {
+    override var opcode: Opcode { .rawWasmModule(self) }
+
+    let bytes: [UInt8]
+    let metadata: WasmModuleMetadata
+
+    init(bytes: [UInt8], metadata: WasmModuleMetadata = WasmModuleMetadata()) {
+        // TODO: Consider validating that bytes represent a valid Wasm module (starts with \0asm)
+        assert(!bytes.isEmpty, "Wasm module bytes should not be empty")
+        self.bytes = bytes
+        self.metadata = metadata
+        super.init(numOutputs: 1, requiredContext: [.javascript])
+    }
+}
+
+final class BeginBundleModule: JsOperation {
+    override var opcode: Opcode { .beginBundleModule(self) }
+    let moduleName: String
+
+    init(moduleName: String) {
+        self.moduleName = moduleName
+        super.init(
+            attributes: .isBlockStart, requiredContext: [.bundle],
+            contextOpened: [.moduleTopLevel, .javascript, .async])
+    }
+}
+
+// The output will be the module.
+final class EndBundleModule: JsOperation {
+    override var opcode: Opcode { .endBundleModule(self) }
+    let moduleName: String
+
+    init(moduleName: String) {
+        self.moduleName = moduleName
+        super.init(numOutputs: 1, attributes: .isBlockEnd, requiredContext: .moduleTopLevel)
+    }
+}
+
+// Pending module forward declaration
+final class DeclarePendingBundleModule: JsOperation {
+    override var opcode: Opcode { .declarePendingBundleModule(self) }
+    let moduleName: String
+    let exportNames: [String]
+
+    init(moduleName: String, exportNames: [String]) {
+        self.moduleName = moduleName
+        self.exportNames = exportNames
+        super.init(numOutputs: 1, requiredContext: [.bundle])
+    }
+}
+
+// Pending module definition. The input is the DeclarePendingBundleModule operation.
+final class BeginPendingBundleModule: JsOperation {
+    override var opcode: Opcode { .beginPendingBundleModule(self) }
+
+    init() {
+        super.init(
+            numInputs: 1,
+            attributes: [.isBlockStart, .isNotInputMutable], requiredContext: [.bundle],
+            contextOpened: [.moduleTopLevel, .javascript, .async])
+    }
+}
+
+final class EndPendingBundleModule: JsOperation {
+    override var opcode: Opcode { .endPendingBundleModule(self) }
+
+    init() {
+        super.init(attributes: .isBlockEnd, requiredContext: .moduleTopLevel)
+    }
+}
+
+final class ExportVariables: JsOperation {
+    override var opcode: Opcode { .exportVariables(self) }
+    let exportNames: [String]
+
+    init(exportNames: [String]) {
+        self.exportNames = exportNames
+        super.init(
+            numInputs: exportNames.count, firstVariadicInput: 0, attributes: .isVariadic,
+            requiredContext: .moduleTopLevel)
+    }
+}
+
+final class ImportVariables: JsOperation {
+    override var opcode: Opcode { .importVariables(self) }
+    let importNames: [String]
+
+    init(importNames: [String]) {
+        self.importNames = importNames
+        super.init(
+            numInputs: 1, numOutputs: importNames.count, attributes: [.isNotInputMutable],
+            requiredContext: .moduleTopLevel)
+    }
+}
+
+final class ImportNamespace: JsOperation {
+    override var opcode: Opcode { .importNamespace(self) }
+    let isDeferred: Bool
+
+    init(isDeferred: Bool) {
+        self.isDeferred = isDeferred
+        super.init(
+            numInputs: 1, numOutputs: 1, attributes: [.isNotInputMutable],
+            requiredContext: .moduleTopLevel)
+    }
+}
+
+final class DynamicImport: JsOperation {
+    override var opcode: Opcode { .dynamicImport(self) }
+    let isDeferred: Bool
+
+    init(isDeferred: Bool) {
+        self.isDeferred = isDeferred
+        super.init(numInputs: 1, numOutputs: 1, attributes: [.isNotInputMutable])
+    }
+}
+
+final class BeginBundleModuleEntryPoint: JsOperation {
+    override var opcode: Opcode { .beginBundleModuleEntryPoint(self) }
+
+    init() {
+        super.init(
+            attributes: .isBlockStart, requiredContext: [.bundle],
+            contextOpened: [.moduleTopLevel, .javascript, .async])
+    }
+}
+
+final class EndBundleModuleEntryPoint: JsOperation {
+    override var opcode: Opcode { .endBundleModuleEntryPoint(self) }
+
+    init() {
+        super.init(attributes: .isBlockEnd, requiredContext: .moduleTopLevel)
+    }
+}
+
+/// Creates a new JavaScript Map object.
+///
+/// While creating a Map is already possible in FuzzIL by calling the `Map`
+/// constructor this dedicated operation allows for parameterizing the types of
+/// the keys and values (via group names), providing more precise type
+/// information to the fuzzer for fuzzing programs with strict type requirements.
+final class CreateMap: JsOperation {
+    override var opcode: Opcode { .createMap(self) }
+
+    var numInitialValues: Int {
+        return numInputs
+    }
+
+    let keyGroupName: String?
+    let valueGroupName: String?
+
+    init(numInitialValues: Int, keyGroupName: String? = nil, valueGroupName: String? = nil) {
+        self.keyGroupName = keyGroupName
+        self.valueGroupName = valueGroupName
+        super.init(
+            numInputs: numInitialValues, numOutputs: 1, firstVariadicInput: 0,
+            attributes: [.isVariadic])
+    }
+}
+
+/// The native FuzzIL representation of a destructuring pattern
+public indirect enum DestructuringPattern: Hashable, Equatable {
+    public var numberOfBindings: Int {
+        var count = 0
+        switch self {
+        case .object(let obj):
+            for prop in obj.properties {
+                count += prop.target.numberOfBindings
+            }
+            if obj.hasRestElement { count += 1 }
+        case .array(let arr):
+            for elem in arr.elements {
+                if let target = elem.target {
+                    count += target.numberOfBindings
+                }
+            }
+            if let restTarget = arr.restTarget {
+                count += restTarget.numberOfBindings
+            }
+        }
+        return count
+    }
+    case object(ObjectPattern)
+    case array(ArrayPattern)
+
+    public enum Target: Hashable, Equatable {
+        public var numberOfBindings: Int {
+            switch self {
+            case .flatBinding:
+                return 1
+            case .pattern(let pattern):
+                return pattern.numberOfBindings
+            case .property, .element, .computedProperty, .superProperty, .superElement,
+                .superComputedProperty, .privateProperty:
+                return 0
+            }
+        }
+        case flatBinding
+        case pattern(DestructuringPattern)
+        case property(String)
+        case element(Int64)
+        case computedProperty
+        case superProperty(String)
+        case superElement(Int64)
+        case superComputedProperty
+        case privateProperty(String)
+    }
+
+    public struct ObjectPattern: Hashable, Equatable {
+        public let properties: [ObjectProperty]
+        public let hasRestElement: Bool
+        public init(properties: [ObjectProperty], hasRestElement: Bool) {
+            self.properties = properties
+            self.hasRestElement = hasRestElement
+        }
+    }
+
+    public struct ObjectProperty: Hashable, Equatable {
+        public enum Key: Hashable, Equatable {
+            case string(String)
+            case computed
+        }
+        public let key: Key
+
+        public let target: Target
+        public let hasDefaultValue: Bool
+
+        public init(key: Key, target: Target, hasDefaultValue: Bool = false) {
+            self.key = key
+            self.target = target
+            self.hasDefaultValue = hasDefaultValue
+        }
+    }
+
+    public struct ArrayPattern: Hashable, Equatable {
+        public let elements: [ArrayElement]
+        public let restTarget: Target?
+
+        public init(elements: [ArrayElement], restTarget: Target?) {
+            self.elements = elements
+            self.restTarget = restTarget
+        }
+    }
+
+    public struct ArrayElement: Hashable, Equatable {
+        public let target: Target?
+        public let hasDefaultValue: Bool
+
+        public init(target: Target?, hasDefaultValue: Bool = false) {
+            self.target = target
+            self.hasDefaultValue = hasDefaultValue
+        }
+    }
+}
+
+extension DestructuringPattern {
+    public var hasNestedDestructuring: Bool {
+        switch self {
+        case .object(let obj):
+            for prop in obj.properties {
+                if case .pattern = prop.target { return true }
+            }
+            return false
+        case .array(let arr):
+            for elem in arr.elements {
+                if case .pattern = elem.target { return true }
+            }
+            if case .pattern = arr.restTarget { return true }
+            return false
+        }
+    }
+
+    public var hasRestElement: Bool {
+        switch self {
+        case .object(let obj):
+            return obj.hasRestElement
+        case .array(let arr):
+            return arr.restTarget != .none
+        }
+    }
+
+    var numExtraInputs: Int {
+        func countTargetInputs(_ target: DestructuringPattern.Target) -> Int {
+            switch target {
+            case .pattern(let p): return p.numExtraInputs
+            case .property, .element, .superComputedProperty, .privateProperty: return 1
+            case .computedProperty: return 2
+            default: return 0
+            }
+        }
+
+        switch self {
+        case .object(let obj):
+            var count = 0
+            for prop in obj.properties {
+                if case .computed = prop.key { count += 1 }
+                if prop.hasDefaultValue { count += 1 }
+                count += countTargetInputs(prop.target)
+            }
+            return count
+        case .array(let arr):
+            var count = 0
+            for elem in arr.elements {
+                if elem.hasDefaultValue { count += 1 }
+                if let target = elem.target {
+                    count += countTargetInputs(target)
+                }
+            }
+            if let restTarget = arr.restTarget {
+                count += countTargetInputs(restTarget)
+            }
+            return count
+        }
+    }
+
+    var numBindings: Int {
+        switch self {
+        case .object(let obj):
+            var count = 0
+            for prop in obj.properties {
+                switch prop.target {
+                case .flatBinding: count += 1
+                case .pattern(let p): count += p.numBindings
+                default: break
+                }
+            }
+            if obj.hasRestElement { count += 1 }
+            return count
+        case .array(let arr):
+            var count = 0
+            for elem in arr.elements {
+                switch elem.target {
+                case .flatBinding: count += 1
+                case .pattern(let p): count += p.numBindings
+                default: break
+                }
+            }
+            switch arr.restTarget {
+            case .flatBinding: count += 1
+            case .pattern(let p): count += p.numBindings
+            default: break
+            }
+            return count
+        }
+    }
+}
+
+/// Destructs a variable using a nested pattern into n output variables.
+///
+/// The inputs to this operation are laid out as follows:
+///   1. `input(0)`: The source object/iterable being destructured.
+///   2. `input(1...n)`: The variables used for computed property keys and default values.
+///      These variables appear in the exact lexicographical order of a depth-first,
+///      left-to-right traversal of the `DestructuringPattern` AST.
+///
+/// The outputs of this operation are the newly declared variables, which also strictly
+/// match the depth-first, left-to-right order of the bindings in the pattern.
+final class Destruct: JsOperation {
+    override var opcode: Opcode { .destruct(self) }
+
+    let pattern: DestructuringPattern
+
+    init(pattern: DestructuringPattern, numInputs: Int, numOutputs: Int) {
+        self.pattern = pattern
+        assert(numInputs == 1 + pattern.numExtraInputs)
+        super.init(numInputs: numInputs, numOutputs: numOutputs, attributes: [.isMutable])
+    }
+}
+
+/// Destructs a variable using a nested pattern and reassigns to n existing variables.
+///
+/// The inputs to this operation are laid out as follows:
+///   1. `input(0)`: The source object/iterable being destructured.
+///   2. `input(1...n)`: A flat, interleaved sequence of variables representing computed property
+///      keys, target variables being reassigned, and default values. These variables appear
+///      in the exact lexicographical order of a depth-first, left-to-right traversal of the
+///      `DestructuringPattern` AST. For any given property/element, the ordering is:
+///      `[computedKeyVariable]`, `[targetVariable]`, `[defaultValueVariable]`.
+final class DestructAndReassign: JsOperation {
+    override var opcode: Opcode { .destructAndReassign(self) }
+
+    let pattern: DestructuringPattern
+    let isTarget: [Bool]
+
+    init(pattern: DestructuringPattern, numInputs: Int) {
+        self.pattern = pattern
+        var isReassignmentTarget = [Bool](repeating: false, count: numInputs)
+        var currentInputIdx = 1
+
+        func traverse(_ pattern: DestructuringPattern) {
+            func traverseTarget(_ target: DestructuringPattern.Target) {
+                switch target {
+                case .flatBinding:
+                    isReassignmentTarget[currentInputIdx] = true
+                    currentInputIdx += 1
+                case .pattern(let p):
+                    traverse(p)
+                case .property, .element, .superComputedProperty, .privateProperty:
+                    currentInputIdx += 1
+                case .computedProperty:
+                    currentInputIdx += 2
+                case .superProperty(_), .superElement(_):
+                    break
+                }
+            }
+
+            switch pattern {
+            case .object(let obj):
+                for prop in obj.properties {
+                    if case .computed = prop.key {
+                        currentInputIdx += 1
+                    }
+                    traverseTarget(prop.target)
+                    if prop.hasDefaultValue {
+                        currentInputIdx += 1
+                    }
+                }
+                if obj.hasRestElement {
+                    isReassignmentTarget[currentInputIdx] = true
+                    currentInputIdx += 1
+                }
+            case .array(let arr):
+                for elem in arr.elements {
+                    if let target = elem.target {
+                        traverseTarget(target)
+                    }
+                    if elem.hasDefaultValue {
+                        currentInputIdx += 1
+                    }
+                }
+                if let restTarget = arr.restTarget {
+                    traverseTarget(restTarget)
+                }
+            }
+        }
+        traverse(pattern)
+        assert(currentInputIdx == numInputs)
+        self.isTarget = isReassignmentTarget
+        super.init(numInputs: numInputs, numOutputs: 0, attributes: [.isMutable])
+    }
+}

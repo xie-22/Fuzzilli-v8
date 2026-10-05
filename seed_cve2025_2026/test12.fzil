@@ -1,0 +1,62 @@
+v0 <- LoadInteger '1'
+v1 <- LoadInteger '2'
+v2 <- LoadInteger '3'
+v3 <- CreateArray [v0, v1, v2]
+v4 <- CreateNamedVariable 'arr', 'let', v3
+BeginForLoop type='forOf' async='false' v4 -> v5, v6
+    BeginForLoopInitializer
+        v7 <- LoadInteger '0'
+    BeginForLoopCondition -> v8
+        v9 <- LoadInteger '50'
+        v10 <- Compare v8, '<', v9
+        v11 <- LoadBoolean 'true'
+    BeginForLoopAfterthought v11 -> v12
+        v13 <- UnaryOperation v12, '++'
+    BeginForLoopBody -> v14, v15
+        BeginForLoopInitializer
+            v16 <- LoadInteger '0'
+        BeginForLoopCondition -> v17
+            v18 <- LoadInteger '5'
+            v19 <- Compare v17, '<', v18
+        BeginForLoopAfterthought v19 -> v20
+            v21 <- UnaryOperation v20, '++'
+        BeginForLoopBody -> v22, v23
+            BeginTry
+                SetElement v22, '9', v22
+                BeginForLoopInitializer
+                    v24 <- LoadInteger '0'
+                BeginForLoopCondition -> v25
+                    v26 <- LoadInteger '10'
+                    v27 <- Compare v25, '<', v26
+                BeginForLoopAfterthought v27 -> v28
+                    v29 <- UnaryOperation v28, '++'
+                BeginForLoopBody -> v30, v31
+                EndForLoop
+                v32 <- LoadUndefined
+                v33 <- CallFunction v32, []
+            BeginCatch -> v34
+                v35 <- CreateNamedVariable 'print', 'none'
+                v36 <- CallFunction v35, [v34]
+            EndTryCatch
+        EndForLoop
+    EndForLoop
+EndForLoop
+
+
+let arr = [1,2,3];
+for (const v5 of arr) {
+    for (let i8 = 0; i8 < 50, true; i8++) {
+        for (let i17 = 0; i17 < 5; i17++) {
+            try {
+                i17[9] = i17;
+                for (let i25 = 0; i25 < 10; i25++) {
+                }
+                undefined();
+            } catch(e34) {
+                print(e34);
+            }
+        }
+    }
+}
+
+FuzzIL program written to /v8/fuzzilli/seed_cve2025_2026/test12.fzil

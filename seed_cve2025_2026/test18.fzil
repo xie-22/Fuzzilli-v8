@@ -1,0 +1,65 @@
+v0 <- BeginPlainFunction -> v1
+    v2 <- LoadFloat '1.1'
+    v3 <- CreateArray [v2]
+    v4 <- CreateNamedVariable 'a', 'const', v3
+    SetElement v4, '0', v1
+    v5 <- GetElement v4, '0'
+    Return v5
+EndPlainFunction
+v6 <- LoadInteger '1'
+v7 <- UnaryOperation '-', v6
+v8 <- CallFunction v0, [v7]
+v9 <- CreateNamedVariable 'H0', 'const', v8
+v10 <- LoadInteger '1'
+v11 <- UnaryOperation '-', v10
+v12 <- CallFunction v0, [v11]
+v13 <- CreateNamedVariable 'H1', 'const', v12
+v14 <- BeginPlainFunction -> v15, v16
+    v17 <- TernaryOperation v15, v9, v13
+    v18 <- CreateNamedVariable 'v', 'let', v17
+    v19 <- LoadFloat '0.1'
+    v20 <- BinaryOperation v18, '+', v19
+    v21 <- CreateNamedVariable 'y', 'let', v20
+    SetProperty v16, 'p', v18
+    Return v21
+EndPlainFunction
+v22 <- Eval '%PrepareFunctionForOptimization(%@)', [v14]
+v23 <- LoadInteger '1'
+BeginObjectLiteral
+    ObjectLiteralAddProperty `x`, v23
+v24 <- EndObjectLiteral
+BeginObjectLiteral
+    ObjectLiteralAddProperty `p`, v24
+v25 <- EndObjectLiteral
+v26 <- CreateNamedVariable 'target', 'let', v25
+v27 <- LoadInteger '0'
+v28 <- CallFunction v14, [v27, v26]
+v29 <- Eval '%OptimizeMaglevOnNextCall(%@)', [v14]
+v30 <- CreateNamedVariable 'gc', 'none'
+v31 <- CallFunction v30, []
+v32 <- LoadInteger '1'
+v33 <- CallFunction v14, [v32, v26]
+
+
+function make_heapnum(a1) {
+    const a = [1.1];
+    a[0] = a1;
+    return a[0];
+}
+const H0 = make_heapnum(-1);
+const H1 = make_heapnum(-1);
+function f(a15, a16) {
+    let v = a15 ? H0 : H1;
+    let y = v + 0.1;
+    a16.p = v;
+    return y;
+}
+const v22 = %PrepareFunctionForOptimization(f);
+const v24 = { x: 1 };
+let target = { p: v24 };
+f(0, target);
+const v29 = %OptimizeMaglevOnNextCall(f);
+gc();
+f(1, target);
+
+FuzzIL program written to /v8/fuzzilli/seed_cve2025_2026/test18.fzil

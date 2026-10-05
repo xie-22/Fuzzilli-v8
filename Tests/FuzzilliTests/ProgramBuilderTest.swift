@@ -1,0 +1,4983 @@
+// Copyright 2019 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+import Testing
+
+@testable import Fuzzilli
+
+struct ProgramBuilderTests {
+    @Test func testConstructorTypeGenerationForAllGroups() {
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+            for groupName in b.fuzzer.environment.allObjectGroupNames {
+                let requiredType = ILType.constructor() + .object(ofGroup: groupName)
+                if let variable = b.maybeGenerateConstructorAsPath(requiredType) {
+                    #expect(b.type(of: variable).Is(requiredType))
+                }
+            }
+        }
+    }
+
+    // Verify that program building doesn't crash and always produce valid programs.
+    @Test func testBuilding() {
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+            let N = 100
+            let numPrograms = 100
+
+            var sumOfProgramSizes = 0
+            for _ in 0..<numPrograms {
+                b.buildPrefix()
+                b.build(n: N)
+                let program = b.finalize()
+                sumOfProgramSizes += program.size
+
+                // Add to corpus since build() does splicing as well
+                fuzzer.corpus.add(program, ProgramAspects(outcome: .succeeded))
+
+                // We'll have generated at least N instructions, probably more.
+                #expect(program.size >= N)
+            }
+
+            // On average, we should generate between n and 2x n instructions.
+            let averageSize = sumOfProgramSizes / numPrograms
+            #expect(averageSize <= 2 * N)
+        }
+    }
+
+    @Test func testTemplateBuilding() {
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+            let numPrograms = 100
+            // let maxExpectedProgramSize = 1000
+            var sumOfProgramSizes = 0
+
+            for _ in 0..<numPrograms {
+                let template = fuzzer.programTemplates.randomElement()!
+                template.generate(in: b)
+                let program = b.finalize()
+                sumOfProgramSizes += program.size
+
+                // Add to corpus since build() does splicing as well
+                fuzzer.corpus.add(program, ProgramAspects(outcome: .succeeded))
+                // TODO: Do not rely on these numbers as we are testing a
+                // distribution and we might sparsely hit this.
+                // XCTAssertLessThan(program.size, maxExpectedProgramSize)
+            }
+
+            let averageSize = sumOfProgramSizes / numPrograms
+            #expect(averageSize < 500)
+        }
+    }
+
+    @Test func testValueBuilding() {
+        // Test that buildValues() is always possible and generates at least the requested
+        // number of new variables.
+        // For this test, we need the full JavaScript environment so that the typer has type
+        // information for builtin objects like the TypedArray constructors.
+        let env = JavaScriptEnvironment()
+        let fuzzer = makeMockFuzzer(environment: env)
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            let codeGenerators = fuzzer.codeGenerators.filter { codeGenerator in
+                // Filter out Generators that do a reassignment as these will make our Variables be typed as .jsAnything.
+                !codeGenerator.name.contains("Reassign")
+            }
+            fuzzer.setCodeGenerators(codeGenerators)
+
+            for _ in 0..<100 {
+                #expect(b.numberOfVisibleVariables == 0)
+
+                // Run a single value generator.
+                let (numberOfGeneratedInstructions, numberOfGeneratedVariables) = b.buildValues(1)
+
+                // Currently the following holds since ValueGenerators never emit instructions with multiple outputs.
+                #expect(numberOfGeneratedInstructions >= numberOfGeneratedVariables)
+
+                // Must now have at least the requested number of visible variables.
+                #expect(b.numberOfVisibleVariables >= 1)
+                #expect(b.numberOfVisibleVariables == numberOfGeneratedVariables)
+
+                // The types of all variables created by a ValueGenerator must be statically inferrable.
+                // However, it is not guaranteed that, after running more than one value generator, all
+                // newly created variables have a known type. For example, it can happen that a recursive
+                // value generator generates a reassignment of a variable created by a previous value
+                // generator. As that should be rare in practice, we don't care too much about that though.
+                for v in b.visibleVariables {
+                    #expect(b.type(of: v) != .jsAnything)
+                }
+
+                let _ = b.finalize()
+            }
+        }
+    }
+
+    @Test func testPrefixBuilding() {
+        // We expect program prefixes (used e.g. for bootstraping code generation but also
+        // by the mutation engine) to produce at least a handful of variables for following
+        // code to operate on.
+        // Internally, prefix generation relies on the value generators tested above.
+        let env = JavaScriptEnvironment()
+        let fuzzer = makeMockFuzzer(environment: env)
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            b.buildPrefix()
+
+            #expect(b.numberOfVisibleVariables >= 5)
+        }
+    }
+
+    @Test func testShapeOfGeneratedCode1() {
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+            let N = 100
+
+            let simpleGenerator = CodeGenerator(
+                "SimpleGenerator", produces: [.integer], useInPrefix: true
+            ) { b in
+                b.loadInt(Int64.random(in: 0..<100))
+            }
+            fuzzer.setCodeGenerators(
+                WeightedList<CodeGenerator>([
+                    (simpleGenerator, 1)
+                ]))
+
+            for _ in 0..<10 {
+                b.buildPrefix()
+                let prefixSize = b.currentNumberOfInstructions
+                b.build(n: N, by: .generating)
+                let program = b.finalize()
+
+                // In this case, the size of the generated code must be exactly the requested size.
+                #expect(program.size - prefixSize == N)
+            }
+        }
+    }
+
+    @Test func testShapeOfGeneratedCode2() {
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+            let N = 100
+
+            let simpleGenerator = CodeGenerator(
+                "SimpleGenerator", produces: [.integer], useInPrefix: true
+            ) { b in
+                b.loadInt(Int64.random(in: 0..<100))
+            }
+            let recursiveGenerator = CodeGenerator("RecursiveGenerator") { b in
+                b.buildRepeatLoop(n: 5) { _ in
+                    b.build(n: 5)
+                }
+            }
+            fuzzer.setCodeGenerators(
+                WeightedList<CodeGenerator>([
+                    (simpleGenerator, 3),
+                    (recursiveGenerator, 1),
+                ]))
+
+            for _ in 0..<10 {
+                b.buildPrefix()
+                let _ = b.currentNumberOfInstructions
+                // let prefixSize = b.currentNumberOfInstructions
+                b.build(n: N, by: .generating)
+                let _ = b.finalize()
+                // let program = b.finalize()
+
+                // Uncomment to see the "shape" of generated programs on the console.
+                //print(FuzzILLifter().lift(program))
+
+                // TODO: We need some robust testing that tests whether we emit code
+                // in the correct distributions, instead of just checking here
+                // against a hard number, which might fail sparsely.
+                // XCTAssertLessThan(program.size - prefixSize, N * 4)
+            }
+        }
+    }
+
+    @Test func testVariableRetrieval1() {
+        // This testcase demonstrates the behavior of `b.randomVariable(forUseAs:)`
+        // This API behaves in the following way:
+        //  - It prefers to return variables that are known to have the requested type
+        //    with probability `b.probabilityOfVariableSelectionTryingToFindAnExactMatch`.
+        //  - Otherwise, it tries a wider match, including all variables that may have the
+        //    requested type. This includes all variables that have unknown type.
+        //  - If even that doesn't find any matches, the function will return a random
+        //    variable that is known to _not_ have the requested type. This should be
+        //    rare though.
+
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            let i = b.loadInt(42)
+            #expect(b.randomVariable(forUseAs: .integer) == i)
+            #expect(b.randomVariable(forUseAs: .jsAnything) == i)
+            #expect(b.randomVariable(forUseAs: .string) == i)
+
+            // Now there's also a string variable. Now, when asking for e.g. an integer, we will not get the string
+            // variable as that is known to have a different type.
+            let s = b.loadString("foobar")
+            #expect(b.randomVariable(forUseAs: .integer) == i)
+            #expect([i, s].contains(b.randomVariable(forUseAs: .primitive)))
+            #expect(b.randomVariable(forUseAs: .string) == s)
+
+            // Now there's also a variable of unknown type, which may be anything.
+            let unknown = b.createNamedVariable(forBuiltin: "unknown")
+            #expect(b.type(of: unknown) == .jsAnything)
+
+            // There is now still a 50% chance that we will do a `MayBe` query, so we may return the unknown variable.
+            #expect([i, unknown].contains(b.randomVariable(forUseAs: .integer)))
+            #expect([i, unknown].contains(b.randomVariable(forUseAs: .number)))
+            #expect([s, unknown].contains(b.randomVariable(forUseAs: .string)))
+            #expect([i, s, unknown].contains(b.randomVariable(forUseAs: .primitive)))
+            #expect([i, s, unknown].contains(b.randomVariable(forUseAs: .jsAnything)))
+
+            b.probabilityOfVariableSelectionTryingToFindAnExactMatch = 1.0
+            // We should now always first look for a variable whose type matches or subsumes the requested one.
+            #expect(b.randomVariable(ofType: .integer) == i)
+            #expect(b.randomVariable(ofType: .number) == i)
+            #expect(b.randomVariable(ofType: .string) == s)
+            #expect([i, s].contains(b.randomVariable(forUseAs: .primitive)))
+            #expect([i, s, unknown].contains(b.randomVariable(forUseAs: .jsAnything)))
+        }
+    }
+
+    @Test func testVariableRetrieval2() {
+        // This testcase demonstrates the behavior of `b.randomVariable(ofType:)`
+        // This API will always return a variable for which `type(of: v).Is(requestedType)` is true,
+        // i.e. for which we can statically infer that the variable has the requested type.
+
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            let v = b.loadInt(42)
+            #expect(b.randomVariable(ofType: .integer) == v)
+            #expect(b.randomVariable(ofType: .number) == v)
+            #expect(b.randomVariable(ofType: .jsAnything) == v)
+            #expect(b.randomVariable(ofType: .string) == nil)
+
+            let s = b.loadString("foobar")
+            #expect(b.randomVariable(ofType: .integer) == v)
+            #expect(b.randomVariable(ofType: .number) == v)
+            #expect([v, s].contains(b.randomVariable(ofType: .primitive)))
+            #expect([v, s].contains(b.randomVariable(ofType: .jsAnything)))
+            #expect(b.randomVariable(ofType: .string) == s)
+
+            let _ = b.finalize()
+
+            let unknown = b.createNamedVariable(forBuiltin: "unknown")
+            #expect(b.type(of: unknown) == .jsAnything)
+            #expect(b.randomVariable(ofType: .integer) == nil)
+            #expect(b.randomVariable(ofType: .number) == nil)
+            #expect(b.randomVariable(ofType: .jsAnything) == unknown)
+
+            let _ = b.finalize()
+
+            let n = b.createNamedVariable(forBuiltin: "theNumber")
+            b.setType(ofVariable: n, to: .number)
+            #expect(b.type(of: n) == .number)
+            #expect(b.randomVariable(ofType: .integer) == nil)
+            #expect(b.randomVariable(ofType: .string) == nil)
+            #expect(b.randomVariable(ofType: .number) == n)
+            #expect(b.randomVariable(ofType: .primitive) == n)
+        }
+    }
+
+    @Test func testVariableRetrieval3() {
+        // This testcase demonstrates the behavior of `b.randomVariable(preferablyNotOfType:)`
+        // This API will always return a variable for which `type(of: v).Is(requestedType)` is false,
+        // i.e. for which we cannot statically infer that the variable has the requested type.
+
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            let v = b.loadInt(42)
+            #expect(b.randomVariable(preferablyNotOfType: .nothing) == v)
+            #expect(b.randomVariable(preferablyNotOfType: .string) == v)
+            #expect(b.randomVariable(preferablyNotOfType: .integer) == nil)
+
+            let s = b.loadString("foobar")
+            #expect(b.randomVariable(preferablyNotOfType: .integer) == s)
+            #expect(b.randomVariable(preferablyNotOfType: .string) == v)
+            #expect([v, s].contains(b.randomVariable(preferablyNotOfType: .boolean)))
+            #expect(b.randomVariable(preferablyNotOfType: .primitive) == nil)
+            #expect(b.randomVariable(preferablyNotOfType: .jsAnything) == nil)
+
+            let unknown = b.createNamedVariable(forBuiltin: "unknown")
+            #expect(b.type(of: unknown) == .jsAnything)
+            #expect([v, unknown].contains(b.randomVariable(preferablyNotOfType: .string)))
+            #expect(b.randomVariable(preferablyNotOfType: .primitive) == unknown)
+            #expect(b.randomVariable(preferablyNotOfType: .jsAnything) == nil)
+        }
+    }
+
+    @Test func testVariableRetrieval4() {
+        // This testcase demonstrates the behavior of `b.randomVariable(forUseAsGuarded:)`
+        // This API behaves in the following way:
+        //  - If a variable that matches or subsumes the requested type was found, it
+        //    returns the variable, along with a boolean that is true.
+        //  - If no matching variable was found, it will return one whose type intersects
+        //    with the requested one, or a random variable. In either of these cases, the
+        //    returned boolean will be false.
+
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            let obj = b.createObject(with: ["x": b.loadInt(1), "y": b.loadInt(2)])
+
+            // We created three visible variables before; obj and its two properties.
+            #expect(b.numberOfVisibleVariables == 3)
+
+            b.probabilityOfVariableSelectionTryingToFindAnExactMatch = 1.0
+
+            do {  // Search with exact match.
+                let (foundVar, matches) = b.randomVariable(forUseAsGuarded: b.type(of: obj))
+                #expect(obj == foundVar)
+                #expect(matches)
+            }
+            do {  // Search for supertype.
+                let (foundVar, matches) = b.randomVariable(
+                    forUseAsGuarded: .object(withProperties: ["x"]))
+                #expect(obj == foundVar)
+                #expect(matches)
+            }
+            do {  // Search for subtype.
+                let (foundVar, matches) = b.randomVariable(
+                    forUseAsGuarded: .object(withProperties: ["x", "y", "z"]))
+                #expect(obj == foundVar)
+                #expect(!matches)
+            }
+            do {  // Search for unrelated type. We ignore the variable, since it's completely random.
+                let (_, matches) = b.randomVariable(forUseAsGuarded: .string)
+                #expect(!matches)
+            }
+        }
+    }
+
+    @Test func testRandomVarableInternal() {
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            b.buildBlockStatement {
+                let var1 = b.loadString("HelloWorld")
+                #expect(b.findVariable(satisfying: { $0 == var1 }) == var1)
+                b.buildBlockStatement {
+                    let var2 = b.loadFloat(13.37)
+                    #expect(b.findVariable(satisfying: { $0 == var2 }) == var2)
+                    b.buildBlockStatement {
+                        let var3 = b.loadInt(100)
+                        #expect(b.findVariable(satisfying: { $0 == var3 }) == var3)
+                    }
+                }
+            }
+        }
+    }
+
+    @Test func testVariableHiding() {
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            let Math = b.createNamedVariable(forBuiltin: "Math")
+
+            #expect(b.visibleVariables.contains(Math))
+            #expect(b.numberOfVisibleVariables == 1)
+            // Hide "Math" as it is only a temporary value that shouldn't be used later on
+            b.hide(Math)
+            #expect(!b.visibleVariables.contains(Math))
+            #expect(b.numberOfVisibleVariables == 0)
+
+            let v = b.loadFloat(13.37)
+            b.callMethod("log", on: Math, withArgs: [v])
+            #expect(b.numberOfVisibleVariables == 2)
+
+            for _ in 0..<10 {
+                #expect(b.randomJsVariable() != Math)
+            }
+
+            // Make sure the variable stays hidden when entering new scopes.
+            b.buildPlainFunction(with: .parameters(n: 2)) { args in
+                b.callMethod("log1p", on: Math, withArgs: [v])
+
+                #expect(!b.visibleVariables.contains(Math))
+                for _ in 0..<10 {
+                    #expect(b.randomJsVariable() != Math)
+                }
+
+                b.callMethod("log2", on: Math, withArgs: [v])
+
+                #expect(b.numberOfVisibleVariables == 6)
+                b.buildRepeatLoop(n: 25) {
+                    let v2 = b.callMethod("log10", on: Math, withArgs: [v])
+                    let v3 = b.callMethod("log10", on: Math, withArgs: [v2])
+                    let v4 = b.callMethod("log10", on: Math, withArgs: [v3])
+
+                    #expect(b.visibleVariables.contains(v2))
+                    #expect(b.visibleVariables.contains(v3))
+                    #expect(b.visibleVariables.contains(v4))
+
+                    // These three variables are hidden but never unhidden.
+                    // However, once they go out of scope, they should be deleted
+                    // from the `hiddenVariables` set in the ProgramBuilder.
+                    #expect(b.numberOfVisibleVariables == 10)
+                    b.hide(v2)
+                    b.hide(v3)
+                    b.hide(v4)
+                    #expect(b.numberOfVisibleVariables == 7)
+
+                    #expect(!b.visibleVariables.contains(Math))
+                    for _ in 0..<10 {
+                        #expect(b.randomJsVariable() != Math)
+                        #expect(b.randomJsVariable() != v2)
+                        #expect(b.randomJsVariable() != v3)
+                        #expect(b.randomJsVariable() != v4)
+                    }
+                }
+                #expect(b.numberOfVisibleVariables == 6)
+
+                #expect(!b.visibleVariables.contains(Math))
+                for _ in 0..<10 {
+                    #expect(b.randomJsVariable() != Math)
+                }
+            }
+
+            #expect(!b.visibleVariables.contains(Math))
+            for _ in 0..<10 {
+                #expect(b.randomJsVariable() != Math)
+            }
+
+            b.unhide(Math)
+            #expect(b.visibleVariables.contains(Math))
+        }
+    }
+
+    @Test func testRecursionGuard() {
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            // The recursion guard feature of the ProgramBuilder is meant to prevent trivial recursion
+            // where a newly created function directly calls itself. It's also meant to prevent somewhat
+            // odd code from being generated where operation inside a function's body operate on the function
+            // itself. However, the guarding is only active during the initial creation of the function,
+            // so future mutations can still build recursive calls etc.
+            let functionVar = Variable(number: 0)
+            let realFunctionVar = b.buildPlainFunction(with: .parameters(n: 3)) { args in
+                // The function variable is hidden during it's initial creation, so that all the code
+                // generated for its body doesn't operate on it (and e.g. cause trivial recursion).
+                #expect(!b.visibleVariables.contains(functionVar))
+                #expect(b.randomJsVariable() != functionVar)
+                #expect(b.randomVariable(ofType: .function()) != functionVar)
+            }
+            #expect(functionVar == realFunctionVar)
+
+            // The function must in any case be visible outside of its body.
+            #expect(b.visibleVariables.contains(functionVar))
+            #expect(b.randomVariable(ofType: .function()) == functionVar)
+
+            let program = b.finalize()
+
+            // However, during later mutations, the function variable is visible and can be used to
+            // construct recursive calls. If these calls end up creating infinite recursion (which is
+            // fairly likely), the mutation will simply be reverted, so there is not much harm caused.
+            for instr in program.code {
+                b.append(instr)
+                if b.context.contains(.subroutine) {
+                    // The function variable should now be visible
+                    #expect(b.visibleVariables.contains(functionVar))
+                    #expect(b.randomVariable(ofType: .function()) == functionVar)
+                }
+            }
+        }
+    }
+
+    @Test func testParameterGeneration1() {
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            // No variables are visible, so we expect to generate functions with no parameters
+            // (since we otherwise won't have any argument values for calling the function).
+            #expect(b.randomParameters().count == 0)
+
+            // But even with a single visible variable, we still expect to generate functions
+            // with no parameters since we could only call the function in exactly one way.
+            b.loadInt(42)
+            #expect(b.randomParameters().count == 0)
+
+            // However, once we have more than one visible variable, we expect to generate functions
+            // that take a few parameters, since we now have at least some arugment values.
+            b.loadInt(43)
+            #expect((1...2).contains(b.randomParameters().count))
+            b.loadInt(44)
+            b.loadInt(45)
+            #expect((1...2).contains(b.randomParameters().count))
+
+            // And once we have plenty of visible variables, we expect to generate functions
+            // with multiple parameters.
+            b.loadInt(46)
+            b.loadInt(47)
+            #expect((2...4).contains(b.randomParameters().count))
+            b.loadInt(48)
+            #expect((2...4).contains(b.randomParameters().count))
+        }
+    }
+
+    @Test func testParameterGeneration2() {
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+            b.probabilityOfUsingAnythingAsParameterTypeIfAvoidable = 0
+
+            // If we have multiple visible variables of the same type, then we expect
+            // generated functions to use this type as parameter type as this ensures
+            // that we will be able to call this function in different ways.
+            let i = b.loadInt(42)
+            b.loadInt(43)
+            b.loadInt(44)
+            #expect(
+                b.randomParameters(n: 1, withRestParameterProbability: 0).parameterTypes[0]
+                    == .integer)
+
+            // The same is true if we have variables of other types, but not enough to
+            // ensure that a function using these types as parameter types can be called
+            // with multiple different argument values.
+            let s = b.loadString("foo")
+            let a = b.createIntArray(with: [1, 2, 3])
+            let o = b.createObject(with: [:])
+            #expect(
+                b.randomParameters(n: 1, withRestParameterProbability: 0).parameterTypes[0]
+                    == .integer)
+
+            // But as soon as we have a sufficient number of other types as well,
+            // we expect those to be used as well.
+            b.loadString("bar")
+            b.loadString("baz")
+            b.createIntArray(with: [4, 5, 6])
+            b.createIntArray(with: [7, 8, 9])
+            b.createObject(with: [:])
+            b.createObject(with: [:])
+
+            let types = [b.type(of: i), b.type(of: s), b.type(of: a), b.type(of: o)]
+            var usesOfParameterType = [ILType: Int]()
+            for _ in 0..<100 {
+                guard
+                    case .plain(let paramType) = b.randomParameters(
+                        n: 1, withRestParameterProbability: 0
+                    ).parameterTypes[0]
+                else {
+                    Issue.record("Unexpected parameter")
+                    return
+                }
+                #expect(types.contains(paramType))
+                usesOfParameterType[paramType] = (usesOfParameterType[paramType] ?? 0) + 1
+            }
+            #expect(usesOfParameterType.values.allSatisfy({ $0 > 0 }))
+
+            // However, if we set the probability of using .jsAnything as parameter to 100%, we expect to only see .jsAnything parameters.
+            b.probabilityOfUsingAnythingAsParameterTypeIfAvoidable = 1.0
+            #expect(
+                b.randomParameters(n: 1, withRestParameterProbability: 0).parameterTypes[0]
+                    == .jsAnything
+            )
+            #expect(
+                b.randomParameters(n: 1, withRestParameterProbability: 0).parameterTypes[0]
+                    == .jsAnything
+            )
+        }
+    }
+
+    @Test func testParameterGeneration3() {
+        // A kind of end-to-end example showing how we might generate a function and use the parameters in a useful way.
+        // We use the real JavaScriptEnvironment here to make sure that this is also how XYZ
+        let env = JavaScriptEnvironment()
+        let fuzzer = makeMockFuzzer(environment: env)
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+            b.probabilityOfUsingAnythingAsParameterTypeIfAvoidable = 0
+
+            let c = b.buildConstructor(with: .parameters(n: 0)) { args in
+                let this = args[0]
+                b.setProperty("x", of: this, to: b.loadInt(0))
+                b.setProperty("y", of: this, to: b.loadInt(0))
+            }
+
+            let p1 = b.construct(c)
+            let p2 = b.construct(c)
+            let p3 = b.construct(c)
+            #expect(b.type(of: p1) == .object(withProperties: ["x", "y"]))
+            #expect(b.type(of: p1) == b.type(of: p2))
+
+            let f1 = b.buildPlainFunction(
+                with: b.randomParameters(n: 1, withRestParameterProbability: 0)
+            ) { args in
+                let p = args[0]
+                #expect(b.type(of: p) == b.type(of: p1))
+                #expect(b.type(of: p).properties == ["x", "y"])
+            }
+            var args = b.randomArguments(forCalling: f1)
+            #expect(args.count == 1)
+            #expect([p1, p2, p3].contains(args[0]))
+
+            let _ = b.finalize()
+
+            // Similar example, but with builtin types.
+            let a1 = b.createIntArray(with: [1, 2, 3])
+            let a2 = b.createIntArray(with: [1, 2, 3])
+            let a3 = b.createIntArray(with: [1, 2, 3])
+
+            // Some sanity checks that we get the right kind of object.
+            #expect(b.type(of: a1).properties.contains("length"))
+            #expect(b.type(of: a1).methods.contains("slice"))
+
+            let f2 = b.buildPlainFunction(
+                with: b.randomParameters(n: 1, withRestParameterProbability: 0)
+            ) { args in
+                let a = args[0]
+                #expect(b.type(of: a) == b.type(of: a1))
+            }
+            args = b.randomArguments(forCalling: f2)
+            #expect(args.count == 1)
+            #expect([a1, a2, a3].contains(args[0]))
+
+            let _ = b.finalize()
+
+            // And another similar example, but this time with a union type: .number
+            let Number = b.createNamedVariable(forBuiltin: "Number")
+            let n1 = b.getProperty("POSITIVE_INFINITY", of: Number)
+            let n2 = b.getProperty("MIN_SAFE_INTEGER", of: Number)
+            let n3 = b.getProperty("MAX_SAFE_INTEGER", of: Number)
+            #expect(b.type(of: n1) == .number)
+            #expect(b.type(of: n1) == b.type(of: n2))
+            #expect(b.type(of: n2) == b.type(of: n3))
+
+            let f3 = b.buildPlainFunction(
+                with: b.randomParameters(n: 1, withRestParameterProbability: 0)
+            ) { args in
+                let a = args[0]
+                #expect(b.type(of: a) == b.type(of: n1))
+            }
+            args = b.randomArguments(forCalling: f3)
+            #expect(args.count == 1)
+            #expect([n1, n2, n3].contains(args[0]))
+        }
+    }
+
+    @Test func testRestParameterGeneration() {
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+            b.loadInt(42)
+            b.loadInt(43)
+
+            // With probability 1.0, we should always generate a rest parameter if possible.
+            let params = b.randomParameters(n: 2, withRestParameterProbability: 1.0)
+            #expect(params.count == 2)
+            #expect(params.parameters.hasRestParameter)
+            guard case .plain(_) = params.parameterTypes[0] else {
+                Issue.record("Expected a plain parameter")
+                return
+            }
+            guard case .rest(_) = params.parameterTypes[1] else {
+                Issue.record("Expected a rest parameter")
+                return
+            }
+        }
+    }
+
+    @Test func testObjectLiteralBuilding() {
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            let i = b.loadInt(42)
+            let s = b.loadString("baz")
+            b.buildObjectLiteral { obj in
+                #expect(obj === b.currentObjectLiteral)
+
+                #expect(!obj.properties.contains("foo"))
+                obj.addProperty("foo", as: i)
+                #expect(obj.properties.contains("foo"))
+
+                #expect(!obj.elements.contains(0))
+                obj.addElement(0, as: i)
+                #expect(obj.elements.contains(0))
+
+                #expect(!obj.computedProperties.contains(s))
+                obj.addComputedProperty(s, as: i)
+                #expect(obj.computedProperties.contains(s))
+
+                #expect(!obj.hasPrototype)
+                obj.setPrototype(to: i)
+                #expect(obj.hasPrototype)
+
+                #expect(!obj.methods.contains("bar"))
+                obj.addMethod("bar", with: .parameters(n: 0)) { args in }
+                #expect(obj.methods.contains("bar"))
+
+                #expect(!obj.computedMethods.contains(s))
+                obj.addComputedMethod(s, with: .parameters(n: 0)) { args in }
+                #expect(obj.computedMethods.contains(s))
+
+                #expect(!obj.getters.contains("foobar"))
+                obj.addGetter(for: "foobar") { this in }
+                #expect(obj.getters.contains("foobar"))
+
+                #expect(!obj.setters.contains("foobar"))
+                obj.addSetter(for: "foobar") { this, v in }
+                #expect(obj.setters.contains("foobar"))
+
+                #expect(obj === b.currentObjectLiteral)
+            }
+
+            let program = b.finalize()
+            #expect(program.size == 16)
+        }
+    }
+
+    @Test(.disabled("Skipping due to https://crbug.com/515494290"))
+    func testOptionsBagAnySubset() throws {
+        /*
+        let fuzzer = makeMockFuzzer()
+        let b = fuzzer.makeBuilder()
+        b.loadInt(0)  // to pass assert(hasVisibleVariables)
+
+        let bag = OptionsBag(
+            name: "TestBag",
+            properties: ["a": .number, "b": .string, "c": .boolean],
+            selectionMode: .anySubset
+        )
+
+        b.createOptionsBag(bag)
+
+        let program = b.finalize()
+
+        // Expect at most 3 properties to be added
+        let addPropertyCount = program.code.filter { $0.op is ObjectLiteralAddProperty }.count
+        XCTAssertLessThanOrEqual(addPropertyCount, 3)
+
+        XCTAssert(program.code.contains(where: { $0.op is BeginObjectLiteral }))
+        XCTAssert(program.code.contains(where: { $0.op is EndObjectLiteral }))
+        */
+    }
+
+    @Test func testOptionsBagExactlyOne() {
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+            b.loadInt(0)  // to pass assert(hasVisibleVariables)
+
+            let bag = OptionsBag(
+                name: "TestBag",
+                properties: ["a": .number, "b": .string, "c": .boolean],
+                selectionMode: .exactlyOne
+            )
+
+            b.createOptionsBag(bag)
+
+            let program = b.finalize()
+
+            // Should be exactly 1 property to be added
+            let addPropertyCount = program.code.filter { $0.op is ObjectLiteralAddProperty }.count
+            #expect(addPropertyCount == 1)
+
+            #expect(program.code.contains(where: { $0.op is BeginObjectLiteral }))
+            #expect(program.code.contains(where: { $0.op is EndObjectLiteral }))
+        }
+    }
+
+    @Test func testClassDefinitionBuilding() {
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            let i = b.loadInt(42)
+            let s = b.loadString("baz")
+            let c = b.buildClassDefinition { cls in
+                #expect(cls === b.currentClassDefinition)
+
+                #expect(!cls.isDerivedClass)
+
+                #expect(!cls.instanceProperties.contains("foo"))
+                cls.addInstanceProperty("foo", value: i)
+                #expect(cls.instanceProperties.contains("foo"))
+
+                #expect(!cls.instanceElements.contains(0))
+                cls.addInstanceElement(0)
+                #expect(cls.instanceElements.contains(0))
+
+                #expect(!cls.instanceComputedProperties.contains(s))
+                cls.addInstanceComputedProperty(s, value: i)
+                #expect(cls.instanceComputedProperties.contains(s))
+
+                #expect(!cls.instanceMethods.contains("bar"))
+                cls.addInstanceMethod("bar", with: .parameters(n: 0)) { args in }
+                #expect(cls.instanceMethods.contains("bar"))
+
+                #expect(!cls.instanceComputedMethods.contains(s))
+                cls.addInstanceComputedMethod(s, with: .parameters(n: 0)) { args in }
+                #expect(cls.instanceComputedMethods.contains(s))
+
+                #expect(!cls.instanceGetters.contains("foobar"))
+                cls.addInstanceGetter(for: "foobar") { this in }
+                #expect(cls.instanceGetters.contains("foobar"))
+
+                #expect(!cls.instanceSetters.contains("foobar"))
+                cls.addInstanceSetter(for: "foobar") { this, v in }
+                #expect(cls.instanceSetters.contains("foobar"))
+
+                #expect(!cls.staticProperties.contains("foo"))
+                cls.addStaticProperty("foo", value: i)
+                #expect(cls.staticProperties.contains("foo"))
+
+                #expect(!cls.staticElements.contains(0))
+                cls.addStaticElement(0)
+                #expect(cls.staticElements.contains(0))
+
+                #expect(!cls.staticComputedProperties.contains(s))
+                cls.addStaticComputedProperty(s, value: i)
+                #expect(cls.staticComputedProperties.contains(s))
+
+                #expect(!cls.staticMethods.contains("bar"))
+                cls.addStaticMethod("bar", with: .parameters(n: 0)) { args in }
+                #expect(cls.staticMethods.contains("bar"))
+
+                #expect(!cls.staticComputedMethods.contains(s))
+                cls.addStaticComputedMethod(s, with: .parameters(n: 0)) { args in }
+                #expect(cls.staticComputedMethods.contains(s))
+
+                #expect(!cls.staticGetters.contains("foobar"))
+                cls.addStaticGetter(for: "foobar") { this in }
+                #expect(cls.staticGetters.contains("foobar"))
+
+                #expect(!cls.staticSetters.contains("foobar"))
+                cls.addStaticSetter(for: "foobar") { this, v in }
+                #expect(cls.staticSetters.contains("foobar"))
+
+                // All private fields, regardless of whether they are per-instance or static and whether they are properties or methods use the same
+                // namespace and each entry must be unique in that namespace. For example, there cannot be both a `#foo` and `static #foo` field.
+                // However, for the purpose of selecting candidates for private property access and private method calls, we also track fields and methods separately.
+                #expect(!cls.privateFields.contains("ifoo"))
+                #expect(!cls.privateProperties.contains("ifoo"))
+                cls.addPrivateInstanceProperty("ifoo", value: i)
+                #expect(cls.privateFields.contains("ifoo"))
+                #expect(cls.privateProperties.contains("ifoo"))
+
+                #expect(!cls.privateFields.contains("ibar"))
+                #expect(!cls.privateMethods.contains("ibar"))
+                cls.addPrivateInstanceMethod("ibar", with: .parameters(n: 0)) { args in }
+                #expect(cls.privateFields.contains("ibar"))
+                #expect(cls.privateMethods.contains("ibar"))
+
+                #expect(!cls.privateFields.contains("sfoo"))
+                #expect(!cls.privateProperties.contains("sfoo"))
+                cls.addPrivateStaticProperty("sfoo", value: i)
+                #expect(cls.privateFields.contains("sfoo"))
+                #expect(cls.privateProperties.contains("sfoo"))
+
+                #expect(!cls.privateFields.contains("sbar"))
+                #expect(!cls.privateMethods.contains("sbar"))
+                cls.addPrivateStaticMethod("sbar", with: .parameters(n: 0)) { args in }
+                #expect(cls.privateFields.contains("sbar"))
+                #expect(cls.privateMethods.contains("sbar"))
+
+                #expect(cls.privateProperties == ["ifoo", "sfoo"])
+                #expect(cls.privateMethods == ["ibar", "sbar"])
+
+                #expect(cls === b.currentClassDefinition)
+            }
+
+            b.buildClassDefinition(withSuperclass: c) { cls in
+                #expect(cls.isDerivedClass)
+            }
+
+            b.buildClassDefinition(withSuperclass: nil) { cls in
+                #expect(!cls.isDerivedClass)
+            }
+
+            let program = b.finalize()
+            #expect(program.size == 36)
+        }
+    }
+
+    @Test func testSwitchBlockBuilding() {
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            let i = b.loadInt(42)
+            let v = b.createNamedVariable(forBuiltin: "v")
+
+            b.buildSwitch(on: v) { swtch in
+                #expect(swtch === b.currentSwitchBlock)
+
+                #expect(!swtch.hasDefaultCase)
+                swtch.addCase(i) {
+
+                }
+
+                #expect(!swtch.hasDefaultCase)
+                swtch.addDefaultCase {
+
+                }
+                #expect(swtch.hasDefaultCase)
+            }
+
+            let program = b.finalize()
+            #expect(program.size == 8)
+        }
+    }
+
+    @Test func testBasicSplicing1() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            let i1 = b.loadInt(0x41)
+            var i2 = b.loadInt(0x42)
+            let cond = b.compare(i1, with: i2, using: .lessThan)
+            b.buildIfElse(
+                cond,
+                ifBody: {
+                    let String = b.createNamedVariable(forBuiltin: "String")
+                    splicePoint = b.indexOfNextInstruction()
+                    b.callMethod("fromCharCode", on: String, withArgs: [i1])
+                    b.callMethod("fromCharCode", on: String, withArgs: [i2])
+                },
+                elseBody: {
+                    b.binary(i1, i2, with: .Add)
+                })
+            let original = b.finalize()
+
+            //
+            // Actual Program
+            //
+            b.splice(from: original, at: splicePoint, mergeDataFlow: false)
+            let actual = b.finalize()
+
+            //
+            // Expected Program
+            //
+            i2 = b.loadInt(0x41)
+            let String = b.createNamedVariable(forBuiltin: "String")
+            b.callMethod("fromCharCode", on: String, withArgs: [i2])
+            let expected = b.finalize()
+
+            #expect(expected == actual)
+        }
+    }
+
+    @Test func testBasicSplicing2() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            var i = b.loadInt(42)
+            b.buildDoWhileLoop(
+                do: {
+                    b.unary(.PostInc, i)
+                }, while: { b.compare(i, with: b.loadInt(44), using: .lessThan) })
+            b.loadFloat(13.37)
+            var arr = b.createArray(with: [i, i, i])
+            b.getProperty("length", of: arr)
+            splicePoint = b.indexOfNextInstruction()
+            b.callMethod("pop", on: arr)
+            let original = b.finalize()
+
+            //
+            // Actual Program (1)
+            //
+            b.probabilityOfIncludingAnInstructionThatMayMutateARequiredVariable = 0.0
+            b.splice(from: original, at: splicePoint, mergeDataFlow: false)
+            let actual1 = b.finalize()
+
+            //
+            // Expected Program (1)
+            //
+            i = b.loadInt(42)
+            arr = b.createArray(with: [i, i, i])
+            b.callMethod("pop", on: arr)
+            let expected1 = b.finalize()
+
+            #expect(expected1 == actual1)
+
+            //
+            // Actual Program (2)
+            //
+            b.probabilityOfIncludingAnInstructionThatMayMutateARequiredVariable = 1.0
+            b.splice(from: original, at: splicePoint, mergeDataFlow: false)
+            let actual2 = b.finalize()
+
+            //
+            // Expected Program (2)
+            //
+            i = b.loadInt(42)
+            b.unary(.PostInc, i)
+            arr = b.createArray(with: [i, i, i])
+            b.callMethod("pop", on: arr)
+            let expected2 = b.finalize()
+
+            #expect(expected2 == actual2)
+        }
+    }
+
+    @Test func testBasicSplicing3() {
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            var i = b.loadInt(42)
+            var f = b.loadFloat(13.37)
+            var f2 = b.loadFloat(133.7)
+            let o = b.createObject(with: ["f": f])
+            b.setProperty("f", of: o, to: f2)
+            b.buildWhileLoop({ b.compare(i, with: b.loadInt(100), using: .lessThan) }) {
+                b.binary(f, f2, with: .Add)
+            }
+            b.getProperty("f", of: o)
+            let original = b.finalize()
+
+            //
+            // Actual Program
+            //
+            let idx = original.code.lastInstruction.index - 1  // Splice at EndWhileLoop
+            #expect(original.code[idx].op is EndWhileLoop)
+            b.splice(from: original, at: idx)
+            let actual = b.finalize()
+
+            //
+            // Expected Program
+            //
+            i = b.loadInt(42)
+            f = b.loadFloat(13.37)
+            f2 = b.loadFloat(133.7)
+            b.buildWhileLoop({ b.compare(i, with: b.loadInt(100), using: .lessThan) }) {
+                // If a block is spliced, its entire body is copied as well
+                b.binary(f, f2, with: .Add)
+            }
+            let expected = b.finalize()
+
+            #expect(expected == actual)
+        }
+    }
+
+    @Test func testBasicSplicing4() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            let f1 = b.buildPlainFunction(with: .parameters(n: 1)) { args1 in
+                let f2 = b.buildPlainFunction(with: .parameters(n: 1)) { args2 in
+                    let s = b.binary(args1[0], args2[0], with: .Add)
+                    b.doReturn(s)
+                }
+                let one = b.loadInt(1)
+                let r = b.callFunction(f2, withArgs: args1 + [one])
+                b.doReturn(r)
+            }
+            let zero = b.loadInt(0)
+            splicePoint = b.indexOfNextInstruction()
+            b.callFunction(f1, withArgs: [zero])
+            let original = b.finalize()
+
+            //
+            // Actual Program
+            //
+            b.splice(from: original, at: splicePoint, mergeDataFlow: false)
+            let actual = b.finalize()
+
+            #expect(original == actual)
+        }
+    }
+
+    @Test func testBasicSplicing5() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            // The whole function is included due to the data dependencies on the parameters
+            let f = b.buildPlainFunction(with: .parameters(n: 3)) { args in
+                let t1 = b.binary(args[0], args[1], with: .Mul)
+                let t2 = b.binary(t1, args[2], with: .Add)
+                let print = b.createNamedVariable(forBuiltin: "print")
+                splicePoint = b.indexOfNextInstruction()
+                b.callFunction(print, withArgs: [t2])
+            }
+            let one = b.loadInt(1)
+            let two = b.loadInt(2)
+            let three = b.loadInt(3)
+            b.callFunction(f, withArgs: [one, two, three])
+            let original = b.finalize()
+
+            //
+            // Actual Program
+            //
+            b.splice(from: original, at: splicePoint, mergeDataFlow: false)
+            let actual = b.finalize()
+
+            //
+            // Expected Program
+            //
+            b.buildPlainFunction(with: .parameters(n: 3)) { args in
+                let t1 = b.binary(args[0], args[1], with: .Mul)
+                let t2 = b.binary(t1, args[2], with: .Add)
+                let print = b.createNamedVariable(forBuiltin: "print")
+                b.callFunction(print, withArgs: [t2])
+            }
+            let expected = b.finalize()
+
+            #expect(expected == actual)
+        }
+    }
+
+    @Test func testBasicSplicing6() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            var n = b.loadInt(10)
+            var f = Variable(number: 1)  // Need to declare this up front as the builder interface doesn't support recursive calls
+            // The whole function is included due to the recursive call
+            f = b.buildPlainFunction(with: .parameters(n: 0)) { _ in
+                b.buildIfElse(
+                    n,
+                    ifBody: {
+                        b.unary(.PostDec, n)
+                        let r = b.callFunction(f)
+                        let two = b.loadInt(2)
+                        splicePoint = b.indexOfNextInstruction()
+                        let v = b.binary(r, two, with: .Mul)
+                        b.doReturn(v)
+                    },
+                    elseBody: {
+                        let one = b.loadInt(1)
+                        b.doReturn(one)
+                    })
+            }
+            #expect(f.number == 1)
+            b.callFunction(f)
+            let original = b.finalize()
+
+            //
+            // Actual Program
+            //
+            b.splice(from: original, at: splicePoint, mergeDataFlow: false)
+            let actual = b.finalize()
+
+            //
+            // Expected program
+            //
+            n = b.loadInt(10)
+            f = Variable(number: 1)
+            f = b.buildPlainFunction(with: .parameters(n: 0)) { _ in
+                b.buildIfElse(
+                    n,
+                    ifBody: {
+                        b.unary(.PostDec, n)
+                        let r = b.callFunction(f)
+                        let two = b.loadInt(2)
+                        splicePoint = b.indexOfNextInstruction()
+                        let v = b.binary(r, two, with: .Mul)
+                        b.doReturn(v)
+                    },
+                    elseBody: {
+                        let one = b.loadInt(1)
+                        b.doReturn(one)
+                    })
+            }
+            #expect(f.number == 1)
+            let expected = b.finalize()
+
+            #expect(expected == actual)
+        }
+    }
+
+    @Test func testBasicSplicing7() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            b.buildAsyncFunction(with: .parameters(n: 0)) { _ in
+                let promise = b.createNamedVariable(forBuiltin: "ThePromise")
+                splicePoint = b.indexOfNextInstruction()
+                b.await(promise)
+            }
+            let original = b.finalize()
+
+            //
+            // Actual Program
+            //
+            // This should fail: we cannot splice the Await as it required .async context.
+            #expect(!b.splice(from: original, at: splicePoint, mergeDataFlow: false))
+            #expect(b.indexOfNextInstruction() == 0)
+            b.buildAsyncFunction(with: .parameters(n: 1)) { args in
+                // This should work however.
+                b.splice(from: original, at: splicePoint, mergeDataFlow: false)
+            }
+            let actual = b.finalize()
+
+            //
+            // Expected Program
+            //
+            b.buildAsyncFunction(with: .parameters(n: 1)) { args in
+                let promise = b.createNamedVariable(forBuiltin: "ThePromise")
+                b.await(promise)
+            }
+            let expected = b.finalize()
+
+            #expect(actual == expected)
+        }
+    }
+
+    @Test func testBasicSplicing8() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            let promise = b.createNamedVariable(forBuiltin: "ThePromise")
+            let f = b.buildAsyncFunction(with: .parameters(n: 0)) { _ in
+                let v = b.await(promise)
+                let zero = b.loadInt(0)
+                let c = b.compare(v, with: zero, using: .notEqual)
+                b.buildIfElse(
+                    c,
+                    ifBody: {
+                        splicePoint = b.indexOfNextInstruction()
+                        b.unary(.PostDec, v)
+                    }, elseBody: {})
+            }
+            b.callFunction(f)
+            let original = b.finalize()
+
+            //
+            // Actual Program
+            //
+            #expect(!b.splice(from: original, at: splicePoint, mergeDataFlow: false))
+            b.buildAsyncFunction(with: .parameters(n: 2)) { _ in
+                b.splice(from: original, at: splicePoint, mergeDataFlow: false)
+            }
+            let actual = b.finalize()
+
+            //
+            // Expected Program
+            //
+
+            b.buildAsyncFunction(with: .parameters(n: 2)) { _ in
+                let promise = b.createNamedVariable(forBuiltin: "ThePromise")
+                let v = b.await(promise)
+                b.unary(.PostDec, v)
+            }
+            let expected = b.finalize()
+
+            #expect(actual == expected)
+        }
+    }
+
+    @Test func testBasicSplicing9() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            b.buildGeneratorFunction(with: .parameters(n: 0)) { _ in
+                let s1 = b.loadString("foo")
+                b.buildTryCatchFinally(
+                    tryBody: {
+                        let s2 = b.loadString("bar")
+                        splicePoint = b.indexOfNextInstruction()
+                        let s3 = b.binary(s1, s2, with: .Add)
+                        b.yield(s3)
+                    },
+                    catchBody: { e in
+                        b.yield(e)
+                    })
+                let s4 = b.loadString("baz")
+                b.yield(s4)
+            }
+            let original = b.finalize()
+
+            //
+            // Actual Program
+            //
+            b.splice(from: original, at: splicePoint, mergeDataFlow: false)
+            let actual = b.finalize()
+
+            //
+            // Expected Program
+            //
+            let s1 = b.loadString("foo")
+            let s2 = b.loadString("bar")
+            b.binary(s1, s2, with: .Add)
+            let expected = b.finalize()
+
+            #expect(actual == expected)
+        }
+    }
+
+    @Test func testBasicSplicing10() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            let foo = b.loadString("foo")
+            let bar = b.loadString("bar")
+            let baz = b.loadString("baz")
+            b.buildGeneratorFunction(with: .parameters(n: 0)) { _ in
+                b.yield(foo)
+                b.buildTryCatchFinally(
+                    tryBody: {
+                        b.throwException(bar)
+                    },
+                    catchBody: { e in
+                        splicePoint = b.indexOfNextInstruction()
+                        b.yield(e)
+                    })
+                b.yield(baz)
+            }
+            let original = b.finalize()
+
+            //
+            // Actual Program
+            //
+            b.buildGeneratorFunction(with: .parameters(n: 0)) { _ in
+                b.yield(b.loadInt(1337))
+                b.splice(from: original, at: splicePoint, mergeDataFlow: false)
+                b.yield(b.loadInt(1338))
+            }
+            let actual = b.finalize()
+
+            //
+            // Expected Program
+            //
+            b.buildGeneratorFunction(with: .parameters(n: 0)) { _ in
+                b.yield(b.loadInt(1337))
+                let bar = b.loadString("bar")
+                b.buildTryCatchFinally(
+                    tryBody: {
+                        b.throwException(bar)
+                    },
+                    catchBody: { e in
+                        splicePoint = b.indexOfNextInstruction()
+                        b.yield(e)
+                    })
+                b.yield(b.loadInt(1338))
+            }
+            let expected = b.finalize()
+
+            #expect(actual == expected)
+        }
+    }
+
+    @Test func testBasicSplicing11() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            // This entire function will be included due to data dependencies on its parameter.
+            b.buildPlainFunction(with: .parameters(n: 1)) { args in
+                b.buildGeneratorFunction(with: .parameters(n: 0)) { _ in
+                    let i = b.loadInt(0)
+                    b.buildWhileLoop({ b.compare(i, with: b.loadInt(100), using: .lessThan) }) {
+                        splicePoint = b.indexOfNextInstruction()
+                        b.buildIfElse(
+                            args[0],
+                            ifBody: {
+                                b.yield(i)
+                            },
+                            elseBody: {
+                                b.loopContinue()
+                            })
+                        b.unary(.PostInc, i)
+                    }
+                }
+            }
+            let original = b.finalize()
+
+            //
+            // Actual Program
+            //
+            b.buildGeneratorFunction(with: .parameters(n: 0)) { _ in
+                b.yield(b.loadInt(1337))
+                let i = b.loadInt(100)
+                b.buildWhileLoop({ b.compare(i, with: b.loadInt(0), using: .greaterThan) }) {
+                    b.splice(from: original, at: splicePoint, mergeDataFlow: false)
+                    b.unary(.PostDec, i)
+                }
+                b.yield(b.loadInt(1338))
+            }
+            let actual = b.finalize()
+
+            //
+            // Expected Program
+            //
+            b.buildGeneratorFunction(with: .parameters(n: 0)) { _ in
+                b.yield(b.loadInt(1337))
+                let i = b.loadInt(100)
+                b.buildWhileLoop({ b.compare(i, with: b.loadInt(0), using: .greaterThan) }) {
+                    b.buildPlainFunction(with: .parameters(n: 1)) { args in
+                        b.buildGeneratorFunction(with: .parameters(n: 0)) { _ in
+                            let i = b.loadInt(0)
+                            b.buildWhileLoop({
+                                b.compare(i, with: b.loadInt(100), using: .lessThan)
+                            }) {
+                                splicePoint = b.indexOfNextInstruction()
+                                b.buildIfElse(
+                                    args[0],
+                                    ifBody: {
+                                        b.yield(i)
+                                    },
+                                    elseBody: {
+                                        b.loopContinue()
+                                    })
+                                b.unary(.PostInc, i)
+                            }
+                        }
+                    }
+                    b.unary(.PostDec, i)
+                }
+                b.yield(b.loadInt(1338))
+            }
+            let expected = b.finalize()
+
+            #expect(actual == expected)
+        }
+    }
+
+    @Test func testDataflowSplicing1() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            let p = b.createNamedVariable(forBuiltin: "ThePromise")
+            let f = b.buildAsyncFunction(with: .parameters(n: 0)) { args in
+                let v = b.await(p)
+                let print = b.createNamedVariable(forBuiltin: "print")
+                splicePoint = b.indexOfNextInstruction()
+                // We can only splice this if we replace |v| with another variable in the host program
+                b.callFunction(print, withArgs: [v])
+            }
+            b.callFunction(f)
+            let original = b.finalize()
+
+            //
+            // Result Program
+            //
+            b.loadInt(1337)
+            b.loadString("Foobar")
+            #expect(b.splice(from: original, at: splicePoint, mergeDataFlow: true))
+            let result = b.finalize()
+
+            #expect(!result.code.contains(where: { $0.op is Await }))
+            #expect(result.code.contains(where: { $0.op is CallFunction }))
+        }
+    }
+
+    @Test func testDataflowSplicing2() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            let f = b.buildPlainFunction(with: .parameters(n: 3)) { args in
+                let t1 = b.binary(args[0], args[1], with: .Add)
+                splicePoint = b.indexOfNextInstruction()
+                let t2 = b.binary(t1, args[2], with: .Add)
+                b.doReturn(t2)
+            }
+            var s1 = b.loadString("Foo")
+            var s2 = b.loadString("Bar")
+            var s3 = b.loadString("Baz")
+            b.callFunction(f, withArgs: [s1, s2, s3])
+            let original = b.finalize()
+
+            //
+            // Result Program
+            //
+            s1 = b.loadString("A")
+            s2 = b.loadString("B")
+            s3 = b.loadString("C")
+            b.splice(from: original, at: splicePoint, mergeDataFlow: true)
+            let result = b.finalize()
+
+            // Either the BeginPlainFunction has been omitted (in which case the parameter usages must have been remapped to an existing variable), or the BeginPlainFunction is included and none of the parameter usages have been remapped.
+            let didSpliceFunction = result.code.contains(where: { $0.op is BeginPlainFunction })
+            let existingVariables = [s1, s2, s3]
+            if didSpliceFunction {
+                for instr in result.code where instr.op is BinaryOperation {
+                    #expect(instr.inputs.allSatisfy({ !existingVariables.contains($0) }))
+                }
+            }
+        }
+    }
+
+    @Test func testDataflowSplicing3() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            var i = b.loadInt(42)
+            var s = b.loadString("foo")
+            var o = b.createObject(with: [:])
+            splicePoint = b.indexOfNextInstruction()
+            b.setComputedProperty(s, of: o, to: i)
+            let original = b.finalize()
+
+            //
+            // Actual Program
+            //
+            // If we set the probability of remapping a variables outputs during splicing to 100% we expect
+            // the slices to just contain a single instruction.
+            #expect(b.probabilityOfRemappingAnInstructionsOutputsDuringSplicing > 0.0)
+            b.probabilityOfRemappingAnInstructionsOutputsDuringSplicing = 1.0
+
+            b.loadInt(1337)
+            b.loadString("bar")
+            b.createObject(with: [:])
+            #expect(b.splice(from: original, at: splicePoint, mergeDataFlow: true))
+            let actual = b.finalize()
+
+            //
+            // Expected Program
+            //
+            // In this case, there are compatible variables for all types, so we expect these to be used.
+            i = b.loadInt(1337)
+            s = b.loadString("bar")
+            o = b.createObject(with: [:])
+            b.setComputedProperty(s, of: o, to: i)
+            let expected = b.finalize()
+
+            #expect(expected == actual)
+        }
+    }
+
+    @Test func testDataflowSplicing4() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            let f = b.buildPlainFunction(with: .parameters(n: 3)) { args in
+                let Array = b.createNamedVariable(forBuiltin: "Array")
+                splicePoint = b.indexOfNextInstruction()
+                b.callMethod("of", on: Array, withArgs: args)
+            }
+            let i1 = b.loadInt(42)
+            let i2 = b.loadInt(43)
+            let i3 = b.loadInt(44)
+            b.callFunction(f, withArgs: [i1, i2, i3])
+            let original = b.finalize()
+
+            // When splicing from the method call, we expect to omit the function definition in many cases and
+            // instead remap the parameters to existing variables in the host program. Otherwise, we'd end up
+            // with a function that's never called.
+            // To test this reliably, we set the probability of remapping inner outputs to 100% but also check
+            // that it is reasonably high by default.
+            #expect(b.probabilityOfRemappingAnInstructionsInnerOutputsDuringSplicing >= 0.5)
+            b.probabilityOfRemappingAnInstructionsInnerOutputsDuringSplicing = 1.0
+
+            b.loadString("Foo")
+            b.loadString("Bar")
+            b.loadString("Baz")
+            #expect(b.splice(from: original, at: splicePoint, mergeDataFlow: true))
+            let result = b.finalize()
+
+            #expect(result.code.contains(where: { $0.op is CallMethod }))
+            #expect(!result.code.contains(where: { $0.op is BeginPlainFunction }))
+        }
+    }
+
+    @Test func testDataflowSplicing5() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            var f = Variable(number: 0)
+            f = b.buildPlainFunction(with: .parameters(n: 1)) { args in
+                let n = args[0]
+                let zero = b.loadInt(0)
+                let one = b.loadInt(1)
+                let c = b.compare(n, with: zero, using: .greaterThan)
+                b.buildIfElse(
+                    c,
+                    ifBody: {
+                        let nMinusOne = b.binary(n, one, with: .Sub)
+                        let t = b.callFunction(f, withArgs: [nMinusOne])
+                        splicePoint = b.indexOfNextInstruction()
+                        let r = b.binary(n, t, with: .Mul)
+                        b.doReturn(r)
+                    },
+                    elseBody: {
+                        b.doReturn(one)
+                    })
+            }
+            #expect(f.number == 0)
+            let i = b.loadInt(42)
+            b.callFunction(f, withArgs: [i])
+            let original = b.finalize()
+
+            //
+            // Actual Program
+            //
+            // Here, even if we replace all parameters of the function, we still include it due to the recursive call.
+            // In that case, we expect none of the parameter usages to have been replaced as the parameters are available.
+            b.probabilityOfRemappingAnInstructionsOutputsDuringSplicing = 0.0
+            b.probabilityOfRemappingAnInstructionsInnerOutputsDuringSplicing = 1.0
+
+            b.loadInt(1337)
+            #expect(b.splice(from: original, at: splicePoint, mergeDataFlow: true))
+            let actual = b.finalize()
+
+            //
+            // Expected Program
+            //
+            b.loadInt(1337)
+            f = Variable(number: 1)
+            f = b.buildPlainFunction(with: .parameters(n: 1)) { args in
+                let n = args[0]
+                let zero = b.loadInt(0)
+                let one = b.loadInt(1)
+                let c = b.compare(n, with: zero, using: .greaterThan)
+                b.buildIfElse(
+                    c,
+                    ifBody: {
+                        let nMinusOne = b.binary(n, one, with: .Sub)
+                        let t = b.callFunction(f, withArgs: [nMinusOne])
+                        splicePoint = b.indexOfNextInstruction()
+                        let r = b.binary(n, t, with: .Mul)
+                        b.doReturn(r)
+                    },
+                    elseBody: {
+                        b.doReturn(one)
+                    })
+            }
+            #expect(f.number == 1)
+            let expected = b.finalize()
+
+            #expect(expected == actual)
+        }
+    }
+
+    @Test func testDataflowSplicing6() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            var f = b.buildPlainFunction(with: .parameters(n: 1)) { args in
+                let print = b.createNamedVariable(forBuiltin: "print")
+                b.callFunction(print, withArgs: args)
+            }
+            var n = b.loadInt(1337)
+            splicePoint = b.indexOfNextInstruction()
+            b.callFunction(f, withArgs: [n])
+            let original = b.finalize()
+
+            //
+            // Actual Program
+            //
+            b.probabilityOfRemappingAnInstructionsOutputsDuringSplicing = 1.0
+
+            // This function is "compatible" with the original function (also one parameter of type .jsAnything).
+            b.buildPlainFunction(with: .parameters(n: 1)) { args in
+                let two = b.loadInt(2)
+                let r = b.binary(args[0], two, with: .Mul)
+                // Due to the way remapping is currently implemented, function return values
+                // are currently assumed to be .jsAnything when looking for compatible functions.
+                b.doReturn(r)
+            }
+            // This function is not compatible since it requires more parameters.
+            b.buildPlainFunction(with: .parameters(n: 2)) { args in
+                let r = b.binary(args[0], args[1], with: .Exp)
+                b.doReturn(r)
+            }
+            b.loadInt(42)
+            b.splice(from: original, at: splicePoint, mergeDataFlow: true)
+            let actual = b.finalize()
+
+            //
+            // Expected Program
+            //
+            // Variables should be remapped to variables of the same type (unless there are none).
+            // In this case, the two functions are compatible because their parameter types are
+            // identical (both take one .jsAnything parameter).
+            f = b.buildPlainFunction(with: .parameters(n: 1)) { args in
+                let two = b.loadInt(2)
+                let r = b.binary(args[0], two, with: .Mul)
+                b.doReturn(r)
+            }
+            b.buildPlainFunction(with: .parameters(n: 2)) { args in
+                let r = b.binary(args[0], args[1], with: .Exp)
+                b.doReturn(r)
+            }
+            n = b.loadInt(42)
+            b.callFunction(f, withArgs: [n])
+            let expected = b.finalize()
+
+            #expect(expected == actual)
+        }
+    }
+
+    @Test func testDataflowSplicing7() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            //
+            // Here we have a function with one parameter of type .jsAnything.
+            var f = b.buildPlainFunction(with: .parameters(n: 1)) { args in
+                let print = b.createNamedVariable(forBuiltin: "print")
+                b.callFunction(print, withArgs: args)
+            }
+            #expect(b.type(of: f).signature?.parameters == [.jsAnything])
+            var n = b.loadInt(1337)
+            splicePoint = b.indexOfNextInstruction()
+            b.callFunction(f, withArgs: [n])
+            let original = b.finalize()
+
+            //
+            // Actual Program
+            //
+            b.probabilityOfRemappingAnInstructionsOutputsDuringSplicing = 1.0
+            // In the host program, we have a function with one parameter of an explicit type.
+            // For splicint, we therefore won't take this function since it's not guaranteed to be compatible.
+            b.buildPlainFunction(with: .parameters(.integer)) { args in
+                let two = b.loadInt(2)
+                let r = b.binary(args[0], two, with: .Mul)
+                b.doReturn(r)
+            }
+            b.loadInt(42)
+            b.splice(from: original, at: splicePoint, mergeDataFlow: true)
+            let actual = b.finalize()
+
+            //
+            // Expected Program
+            //
+            let expected: Program
+            // The host function isn't guaranteed to be compatible, so don't take it.
+            b.buildPlainFunction(with: .parameters(n: 1)) { args in
+                let two = b.loadInt(2)
+                let r = b.binary(args[0], two, with: .Mul)
+                b.doReturn(r)
+            }
+            n = b.loadInt(42)
+            f = b.buildPlainFunction(with: .parameters(n: 1)) { args in
+                let print = b.createNamedVariable(forBuiltin: "print")
+                b.callFunction(print, withArgs: args)
+            }
+            b.callFunction(f, withArgs: [n])
+            expected = b.finalize()
+
+            #expect(FuzzILLifter().lift(actual) == FuzzILLifter().lift(expected))
+            #expect(actual == expected)
+        }
+    }
+
+    @Test func testDataflowSplicing8() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            var i = b.loadInt(42)
+            splicePoint = b.indexOfNextInstruction()
+            b.unary(.PostInc, i)
+            let original = b.finalize()
+
+            //
+            // Actual Program
+            //
+            b.probabilityOfRemappingAnInstructionsOutputsDuringSplicing = 1.0
+
+            // For splicing, we will not use a variable of an unknown type as replacement.
+            let unknown = b.createNamedVariable(forBuiltin: "unknown")
+            #expect(b.type(of: unknown) == .jsAnything)
+            b.loadBool(true)  // This should also never be used as replacement as it definitely has a different type
+            b.splice(from: original, at: splicePoint, mergeDataFlow: true)
+            let actual = b.finalize()
+
+            //
+            // Expected Program
+            //
+            let expected: Program
+            b.createNamedVariable(forBuiltin: "unknown")
+            b.loadBool(true)
+            i = b.loadInt(42)
+            b.unary(.PostInc, i)
+            expected = b.finalize()
+
+            #expect(actual == expected)
+        }
+    }
+
+    @Test func testDataflowSplicing9() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            var i1 = b.loadInt(41)
+            var i2 = b.loadInt(42)
+            splicePoint = b.indexOfNextInstruction()
+            b.binary(i1, i2, with: .Exp)
+            let original = b.finalize()
+
+            //
+            // Actual Program
+            //
+            b.probabilityOfRemappingAnInstructionsOutputsDuringSplicing = 1.0
+
+            // In this case, all existing variables are known to definitely have a different
+            // type than the one we're looking for (.integer) when trying to replace the outputs
+            // of the LoadInt operations. In this case we don't replace the outputs in such cases.
+            b.loadString("foobar")
+            b.loadBool(true)
+            b.splice(from: original, at: splicePoint, mergeDataFlow: true)
+            let actual = b.finalize()
+
+            //
+            // Expected Program
+            //
+            b.loadString("foobar")
+            b.loadBool(true)
+            i1 = b.loadInt(41)
+            i2 = b.loadInt(42)
+            b.binary(i1, i2, with: .Exp)
+            let expected = b.finalize()
+
+            #expect(actual == expected)
+        }
+    }
+
+    @Test func testObjectLiteralSplicing1() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            let v = b.loadInt(42)
+            let p = b.loadString("foobar")
+            let o = b.buildObjectLiteral { obj in
+                obj.addElement(0, as: v)
+                obj.addComputedProperty(p, as: v)
+            }
+            splicePoint = b.indexOfNextInstruction()
+            b.getProperty("foobar", of: o)
+            let original = b.finalize()
+
+            //
+            // Actual Program
+            //
+            b.splice(from: original, at: splicePoint, mergeDataFlow: false)
+            let actual = b.finalize()
+
+            #expect(actual == original)
+        }
+    }
+
+    @Test func testObjectLiteralSplicing2() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            let v = b.loadInt(42)
+            b.buildObjectLiteral { obj in
+                obj.addProperty("foo", as: v)
+                splicePoint = b.indexOfNextInstruction()
+                obj.addGetter(for: "baz") { this in
+                    b.doReturn(b.loadString("baz"))
+                }
+            }
+            let original = b.finalize()
+
+            //
+            // Actual Program
+            //
+            var foo = b.loadString("foo")
+            var bar = b.loadString("bar")
+            b.buildObjectLiteral { obj in
+                obj.addElement(0, as: foo)
+                b.splice(from: original, at: splicePoint, mergeDataFlow: false)
+                obj.addElement(1, as: bar)
+            }
+            let actual = b.finalize()
+
+            //
+            // Expected Program
+            //
+            foo = b.loadString("foo")
+            bar = b.loadString("bar")
+            b.buildObjectLiteral { obj in
+                obj.addElement(0, as: foo)
+                obj.addGetter(for: "baz") { this in
+                    b.doReturn(b.loadString(("baz")))
+                }
+                obj.addElement(1, as: bar)
+            }
+            let expected = b.finalize()
+
+            #expect(actual == expected)
+        }
+    }
+
+    @Test func testObjectLiteralSplicing3() {
+        // This tests that the object variable, which is an output of the EndObjectLiteral
+        // instruction (not the BeginObjectLiteral!) is properly handled during splicing.
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            let f = b.buildPlainFunction(with: .parameters(n: 2)) { args in
+                let o = b.buildObjectLiteral { obj in
+                    obj.addProperty("x", as: args[0])
+                    obj.addProperty("y", as: args[1])
+                }
+                b.doReturn(o)
+            }
+            let v = b.loadInt(42)
+            splicePoint = b.indexOfNextInstruction()
+            b.callFunction(f, withArgs: [v, v])
+            let original = b.finalize()
+
+            //
+            // Actual Program
+            //
+            b.splice(from: original, at: splicePoint, mergeDataFlow: false)
+            let actual = b.finalize()
+
+            #expect(actual == original)
+        }
+    }
+
+    @Test func testClassDefinitionSplicing1() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            let v = b.loadInt(1337)
+            let c = b.buildClassDefinition { cls in
+                cls.addInstanceProperty("foo", value: v)
+                cls.addStaticProperty("bar")
+                cls.addInstanceElement(0)
+            }
+            splicePoint = b.indexOfNextInstruction()
+            b.construct(c)
+            let original = b.finalize()
+
+            //
+            // Actual Program
+            //
+            b.splice(from: original, at: splicePoint, mergeDataFlow: false)
+            let actual = b.finalize()
+
+            #expect(actual == original)
+        }
+    }
+
+    @Test func testClassDefinitionSplicing2() {
+        var splicePoint1 = -1
+        var splicePoint2 = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            b.buildClassDefinition { cls in
+                cls.addInstanceProperty("foo")
+                cls.addConstructor(with: .parameters(n: 1)) { args in
+                    let this = args[0]
+                    b.setProperty("foo", of: this, to: args[1])
+                }
+                splicePoint1 = b.indexOfNextInstruction()
+                cls.addInstanceMethod("bar", with: .parameters(n: 0)) { args in
+                    let this = args[0]
+                    let one = b.loadInt(1)
+                    b.updateProperty("count", of: this, with: one, using: .Add)
+                }
+                splicePoint2 = b.indexOfNextInstruction()
+                cls.addStaticElement(42)
+            }
+            let original = b.finalize()
+
+            //
+            // Actual Program
+            //
+            b.buildClassDefinition { cls in
+                b.splice(from: original, at: splicePoint1, mergeDataFlow: false)
+                b.splice(from: original, at: splicePoint2, mergeDataFlow: false)
+            }
+            let actual = b.finalize()
+
+            //
+            // Expected Program
+            //
+            b.buildClassDefinition { cls in
+                cls.addInstanceMethod("bar", with: .parameters(n: 0)) { args in
+                    let this = args[0]
+                    let one = b.loadInt(1)
+                    b.updateProperty("count", of: this, with: one, using: .Add)
+                }
+                cls.addStaticElement(42)
+            }
+            let expected = b.finalize()
+
+            #expect(actual == expected)
+        }
+    }
+
+    @Test func testFunctionSplicing1() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            b.loadString("foo")
+            var i1 = b.loadInt(42)
+            var f = b.buildPlainFunction(with: .parameters(n: 1)) { args in
+                let i3 = b.binary(i1, args[0], with: .Add)
+                b.doReturn(i3)
+            }
+            b.loadString("bar")
+            var i2 = b.loadInt(43)
+            splicePoint = b.indexOfNextInstruction()
+            b.callFunction(f, withArgs: [i2])
+            let original = b.finalize()
+
+            //
+            // Actual Program
+            //
+            b.splice(from: original, at: splicePoint, mergeDataFlow: false)
+            let actual = b.finalize()
+
+            //
+            // Expected Program
+            //
+            i1 = b.loadInt(42)
+            f = b.buildPlainFunction(with: .parameters(n: 1)) { args in
+                let i3 = b.binary(i1, args[0], with: .Add)
+                b.doReturn(i3)
+            }
+            i2 = b.loadInt(43)
+            b.callFunction(f, withArgs: [i2])
+            let expected = b.finalize()
+
+            #expect(actual == expected)
+        }
+    }
+
+    @Test func testFunctionSplicing2() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            var f = b.buildPlainFunction(with: .parameters(n: 2)) { args in
+                splicePoint = b.indexOfNextInstruction()
+                b.buildForLoop(
+                    i: { args[0] }, { i in b.compare(i, with: args[1], using: .lessThan) },
+                    { i in b.unary(.PostInc, i) }
+                ) { i in
+                    b.callFunction(b.createNamedVariable(forBuiltin: "print"), withArgs: [i])
+                    b.loopBreak()
+                }
+            }
+            let arg1 = b.loadInt(42)
+            let arg2 = b.loadInt(43)
+            b.callFunction(f, withArgs: [arg1, arg2])
+            let original = b.finalize()
+
+            //
+            // Actual Program
+            //
+            b.splice(from: original, at: splicePoint, mergeDataFlow: false)
+            let actual = b.finalize()
+
+            //
+            // Expected Program
+            //
+            f = b.buildPlainFunction(with: .parameters(n: 2)) { args in
+                splicePoint = b.indexOfNextInstruction()
+                b.buildForLoop(
+                    i: { args[0] }, { i in b.compare(i, with: args[1], using: .lessThan) },
+                    { i in b.unary(.PostInc, i) }
+                ) { i in
+                    b.callFunction(b.createNamedVariable(forBuiltin: "print"), withArgs: [i])
+                    b.loopBreak()
+                }
+            }
+            let expected = b.finalize()
+
+            #expect(actual == expected)
+        }
+    }
+
+    @Test func testSplicingOfMutatingOperations() {
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+            #expect(b.probabilityOfIncludingAnInstructionThatMayMutateARequiredVariable > 0.0)
+            b.probabilityOfIncludingAnInstructionThatMayMutateARequiredVariable = 1.0
+
+            //
+            // Original Program
+            //
+            var f2 = b.loadFloat(13.37)
+            b.buildPlainFunction(with: .parameters(n: 1)) { args in
+                let i = b.loadInt(42)
+                let f = b.loadFloat(13.37)
+                b.reassign(variable: f2, value: b.loadFloat(133.7))
+                let o = b.createObject(with: ["i": i, "f": f])
+                let o2 = b.createObject(with: ["i": i, "f": f2])
+                b.binary(i, args[0], with: .Add)
+                b.setProperty("f", of: o, to: f2)
+                let object = b.createNamedVariable(forBuiltin: "Object")
+                let descriptor = b.createObject(with: ["value": b.loadString("foobar")])
+                b.callMethod(
+                    "defineProperty", on: object, withArgs: [o, b.loadString("s"), descriptor])
+                b.callMethod(
+                    "defineProperty", on: object, withArgs: [o2, b.loadString("s"), descriptor])
+                let json = b.createNamedVariable(forBuiltin: "JSON")
+                b.callMethod("stringify", on: json, withArgs: [o])
+            }
+            let original = b.finalize()
+
+            //
+            // Actual Program
+            //
+            let idx = original.code.lastInstruction.index - 1
+            #expect(original.code[idx].op is CallMethod)
+            b.splice(from: original, at: idx)
+            let actual = b.finalize()
+
+            //
+            // Expected Program
+            //
+            f2 = b.loadFloat(13.37)
+            let i = b.loadInt(42)
+            let f = b.loadFloat(13.37)
+            b.reassign(variable: f2, value: b.loadFloat(133.7))  // (Possibly) mutating instruction must be included
+            let o = b.createObject(with: ["i": i, "f": f])
+            b.setProperty("f", of: o, to: f2)  // (Possibly) mutating instruction must be included
+            let object = b.createNamedVariable(forBuiltin: "Object")
+            let descriptor = b.createObject(with: ["value": b.loadString("foobar")])
+            b.callMethod(
+                "defineProperty", on: object, withArgs: [o, b.loadString("s"), descriptor])  // (Possibly) mutating instruction must be included
+            let json = b.createNamedVariable(forBuiltin: "JSON")
+            b.callMethod("stringify", on: json, withArgs: [o])
+            let expected = b.finalize()
+
+            #expect(expected == actual)
+        }
+    }
+
+    @Test func testClassSplicing() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            var superclass = b.buildClassDefinition { cls in
+                cls.addConstructor(with: .parameters(n: 1)) { params in
+                }
+
+                cls.addInstanceProperty("a")
+
+                cls.addInstanceMethod("f", with: .parameters(n: 1)) { params in
+                    b.doReturn(b.loadString("foobar"))
+                }
+            }
+            let _ = b.buildClassDefinition(withSuperclass: superclass) { cls in
+                cls.addConstructor(with: .parameters(n: 1)) { params in
+                    b.buildRepeatLoop(n: 10) { _ in
+                        let v0 = b.loadInt(42)
+                        let v1 = b.createObject(with: ["foo": v0])
+                        splicePoint = b.indexOfNextInstruction()
+                        b.callSuperConstructor(withArgs: [v1])
+                    }
+                }
+                cls.addInstanceProperty("b")
+
+                cls.addInstanceMethod("g", with: .parameters(n: 1)) { params in
+                    b.buildPlainFunction(with: .parameters(n: 0)) { _ in
+                    }
+                }
+            }
+            let original = b.finalize()
+
+            //
+            // Actual Program
+            //
+            superclass = b.buildClassDefinition { cls in
+                cls.addConstructor(with: .parameters(n: 1)) { params in
+                }
+            }
+            b.buildClassDefinition(withSuperclass: superclass) { cls in
+                cls.addConstructor(with: .parameters(n: 1)) { _ in
+                    // Splicing at CallSuperConstructor
+                    b.splice(from: original, at: splicePoint, mergeDataFlow: false)
+                }
+            }
+
+            let actual = b.finalize()
+
+            //
+            // Expected Program
+            //
+            superclass = b.buildClassDefinition { cls in
+                cls.addConstructor(with: .parameters(n: 1)) { params in
+                }
+            }
+            b.buildClassDefinition(withSuperclass: superclass) { cls in
+                cls.addConstructor(with: .parameters(n: 1)) { _ in
+                    let v0 = b.loadInt(42)
+                    let v1 = b.createObject(with: ["foo": v0])
+                    b.callSuperConstructor(withArgs: [v1])
+                }
+            }
+            let expected = b.finalize()
+
+            #expect(actual == expected)
+        }
+    }
+
+    @Test func testAsyncGeneratorSplicing() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            b.buildAsyncGeneratorFunction(with: .parameters(n: 2)) { _ in
+                let p = b.createNamedVariable(forBuiltin: "thePromise")
+                b.buildDoWhileLoop(
+                    do: {
+                        let v0 = b.loadInt(42)
+                        let _ = b.createObject(with: ["foo": v0])
+                        splicePoint = b.indexOfNextInstruction()
+                        b.await(p)
+                        let v8 = b.loadInt(1337)
+                        b.yield(v8)
+                    }, while: { b.loadBool(false) })
+            }
+            let original = b.finalize()
+
+            //
+            // Actual Program
+            //
+            b.buildAsyncFunction(with: .parameters(n: 1)) { _ in
+                // Splicing at Await
+                b.splice(from: original, at: splicePoint, mergeDataFlow: false)
+            }
+            let actual = b.finalize()
+
+            //
+            // Expected Program
+            //
+            b.buildAsyncFunction(with: .parameters(n: 1)) { _ in
+                let p = b.createNamedVariable(forBuiltin: "thePromise")
+                let _ = b.await(p)
+            }
+            let expected = b.finalize()
+
+            #expect(actual == expected)
+        }
+    }
+
+    @Test func testLoopSplicing1() {
+        var splicePoint = -1
+        var invalidSplicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            let i = b.loadInt(0)
+            let end = b.loadInt(100)
+            b.buildWhileLoop({ b.compare(i, with: end, using: .lessThan) }) {
+                let i2 = b.loadInt(0)
+                let end2 = b.loadInt(10)
+                splicePoint = b.indexOfNextInstruction()
+                b.buildWhileLoop({ b.compare(i2, with: end2, using: .lessThan) }) {
+                    let mid = b.binary(end2, b.loadInt(2), with: .Div)
+                    let cond = b.compare(i2, with: mid, using: .greaterThan)
+                    b.buildIfElse(
+                        cond,
+                        ifBody: {
+                            b.loopContinue()
+                        },
+                        elseBody: {
+                            invalidSplicePoint = b.indexOfNextInstruction()
+                            b.loopBreak()
+                        })
+                    b.unary(.PostInc, i2)
+                }
+                b.unary(.PostInc, i)
+            }
+            let original = b.finalize()
+
+            //
+            // Actual Program
+            //
+            #expect(!b.splice(from: original, at: invalidSplicePoint, mergeDataFlow: false))
+            #expect(b.splice(from: original, at: splicePoint, mergeDataFlow: false))
+            let actual = b.finalize()
+
+            //
+            // Expected Program
+            //
+            let i2 = b.loadInt(0)
+            let end2 = b.loadInt(10)
+            b.buildWhileLoop({ b.compare(i2, with: end2, using: .lessThan) }) {
+                let mid = b.binary(end2, b.loadInt(2), with: .Div)
+                let cond = b.compare(i2, with: mid, using: .greaterThan)
+                b.buildIfElse(
+                    cond,
+                    ifBody: {
+                        b.loopContinue()
+                    },
+                    elseBody: {
+                        b.loopBreak()
+                    })
+                b.unary(.PostInc, i2)
+            }
+            let expected = b.finalize()
+
+            #expect(actual == expected)
+        }
+    }
+
+    @Test func testLoopSplicing2() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            b.buildWhileLoop({
+                let c = b.loadBool(true)
+                // Test that splicing at the BeginWhileLoopBody works as expected
+                splicePoint = b.indexOfNextInstruction()
+                return c
+            }) {
+                let foobar = b.createNamedVariable(forBuiltin: "foobar")
+                b.callFunction(foobar)
+            }
+            let original = b.finalize()
+
+            //
+            // Actual Program
+            //
+            #expect(b.splice(from: original, at: splicePoint, mergeDataFlow: false))
+            let actual = b.finalize()
+
+            #expect(actual == original)
+        }
+    }
+
+    @Test func testLoopSplicing3() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            b.buildDoWhileLoop(
+                do: {
+                    let foo = b.createNamedVariable(forBuiltin: "foo")
+                    b.callFunction(foo)
+                },
+                while: {
+                    // Test that splicing out of the header works.
+                    let bar = b.createNamedVariable(forBuiltin: "bar")
+                    splicePoint = b.indexOfNextInstruction()
+                    b.callFunction(bar)
+                    return b.loadBool(false)
+                })
+            let original = b.finalize()
+
+            //
+            // Actual Program
+            //
+            #expect(b.splice(from: original, at: splicePoint, mergeDataFlow: false))
+            let actual = b.finalize()
+
+            //
+            // Expected Program
+            //
+            let bar = b.createNamedVariable(forBuiltin: "bar")
+            b.callFunction(bar)
+            let expected = b.finalize()
+
+            #expect(actual == expected)
+        }
+    }
+
+    @Test func testForInSplicing() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            b.loadString("unused")
+            var i = b.loadInt(10)
+            var s = b.loadString("Bar")
+            var f = b.loadFloat(13.37)
+            var o1 = b.createObject(with: ["foo": i, "bar": s, "baz": f])
+            b.loadString("unused")
+            var o2 = b.createObject(with: [:])
+            b.buildForInOfLoop(o1, type: .forIn, isAsync: false, header: .simple) { vars, _ in
+                let p = vars[0]
+                let i = b.loadInt(1337)
+                b.loadString("unusedButPartOfBody")
+                splicePoint = b.indexOfNextInstruction()
+                b.setComputedProperty(p, of: o2, to: i)
+            }
+            b.loadString("unused")
+            let original = b.finalize()
+
+            //
+            // Actual Program
+            //
+            b.splice(from: original, at: splicePoint, mergeDataFlow: false)
+            let actual = b.finalize()
+
+            //
+            // Expected Program
+            //
+            i = b.loadInt(10)
+            s = b.loadString("Bar")
+            f = b.loadFloat(13.37)
+            o1 = b.createObject(with: ["foo": i, "bar": s, "baz": f])
+            o2 = b.createObject(with: [:])
+            b.buildForInOfLoop(o1, type: .forIn, isAsync: false, header: .simple) { vars, _ in
+                let p = vars[0]
+                let i = b.loadInt(1337)
+                b.loadString("unusedButPartOfBody")
+                b.setComputedProperty(p, of: o2, to: i)
+            }
+            let expected = b.finalize()
+
+            #expect(actual == expected)
+        }
+    }
+
+    @Test func testTryCatchSplicing() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            let s = b.loadString("foo")
+            b.buildTryCatchFinally(
+                tryBody: {
+                    let v = b.loadString("bar")
+                    b.throwException(v)
+                },
+                catchBody: { e in
+                    splicePoint = b.indexOfNextInstruction()
+                    b.reassign(variable: e, value: s)
+                })
+            let original = b.finalize()
+
+            //
+            // Actual Program
+            //
+            b.splice(from: original, at: splicePoint, mergeDataFlow: false)
+            let actual = b.finalize()
+
+            #expect(actual == original)
+        }
+    }
+
+    @Test func testWasmEndTypeGroupSplicing() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            b.wasmDefineTypeGroup {
+                let typeA = b.wasmDefineArrayType(elementType: .wasmi32, mutability: false)
+                let typeB = b.wasmDefineArrayType(elementType: .wasmi64, mutability: false)
+                splicePoint = b.indexOfNextInstruction()  // the WasmEndTypeGroup
+                return [typeA, typeB]
+            }
+            let original = b.finalize()
+
+            //
+            // Actual Program
+            //
+            b.wasmDefineTypeGroup {
+                [b.wasmDefineArrayType(elementType: .wasmi64, mutability: false)]
+            }
+            #expect(b.splice(from: original, at: splicePoint, mergeDataFlow: false))
+            let actual = b.finalize()
+
+            //
+            // Expected Program
+            //
+            b.wasmDefineTypeGroup {
+                [b.wasmDefineArrayType(elementType: .wasmi64, mutability: false)]
+            }
+            b.wasmDefineTypeGroup {
+                [
+                    b.wasmDefineArrayType(elementType: .wasmi32, mutability: false),
+                    b.wasmDefineArrayType(elementType: .wasmi64, mutability: false),
+                ]
+            }
+            let expected = b.finalize()
+
+            #expect(actual == expected)
+        }
+    }
+
+    @Test func testCodeStringSplicing() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            b.buildRepeatLoop(n: 5) { _ in
+                b.loadThis()
+                let code = b.buildCodeString {
+                    let i = b.loadInt(42)
+                    let o = b.createObject(with: ["i": i])
+                    let json = b.createNamedVariable(forBuiltin: "JSON")
+                    b.callMethod("stringify", on: json, withArgs: [o])
+                }
+                let eval = b.createNamedVariable(forBuiltin: "eval")
+                splicePoint = b.indexOfNextInstruction()
+                b.callFunction(eval, withArgs: [code])
+            }
+            let original = b.finalize()
+
+            //
+            // Actual Program
+            //
+            #expect(b.splice(from: original, at: splicePoint, mergeDataFlow: false))
+            let actual = b.finalize()
+
+            //
+            // Expected Program
+            //
+            let code = b.buildCodeString {
+                let i = b.loadInt(42)
+                let o = b.createObject(with: ["i": i])
+                let json = b.createNamedVariable(forBuiltin: "JSON")
+                b.callMethod("stringify", on: json, withArgs: [o])
+            }
+            let eval = b.createNamedVariable(forBuiltin: "eval")
+            b.callFunction(eval, withArgs: [code])
+            let expected = b.finalize()
+
+            #expect(actual == expected)
+        }
+    }
+
+    @Test func testSwitchBlockSplicing1() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            let i1 = b.loadInt(1)
+            let i2 = b.loadInt(2)
+            let i3 = b.loadInt(3)
+            let s = b.loadString("Foo")
+            splicePoint = b.indexOfNextInstruction()
+            b.buildSwitch(on: i1) { swtch in
+                swtch.addCase(i2) {
+                    b.reassign(variable: s, value: b.loadString("Bar"))
+                }
+                swtch.addCase(i3) {
+                    b.reassign(variable: s, value: b.loadString("Baz"))
+                }
+                swtch.addDefaultCase {
+                    b.reassign(variable: s, value: b.loadString("Bla"))
+                }
+            }
+            let original = b.finalize()
+
+            //
+            // Actual Program
+            //
+            b.splice(from: original, at: splicePoint, mergeDataFlow: false)
+            let actual = b.finalize()
+
+            #expect(actual == original)
+        }
+    }
+
+    @Test func testSwitchBlockSplicing2() {
+        var splicePoint = -1
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            //
+            // Original Program
+            //
+            var i1 = b.loadInt(1)
+            var i2 = b.loadInt(2)
+            var i3 = b.loadInt(3)
+            var s = b.loadString("Foo")
+            b.buildSwitch(on: i1) { swtch in
+                swtch.addCase(i2) {
+                    b.reassign(variable: s, value: b.loadString("Bar"))
+                }
+                swtch.addCase(i3) {
+                    b.reassign(variable: s, value: b.loadString("Baz"))
+                }
+                swtch.addDefaultCase {
+                    b.reassign(variable: s, value: b.loadString("Bla"))
+                }
+            }
+            let original = b.finalize()
+            splicePoint = original.code.firstIndex(where: { $0.op is BeginSwitchCase })!
+
+            //
+            // Result Program
+            //
+            // Splicing a BeginSwitchCase is not possible here as we don't (yet) have a BeginSwitch.
+            #expect(!b.splice(from: original, at: splicePoint, mergeDataFlow: true))
+            i1 = b.loadInt(10)
+            i2 = b.loadInt(20)
+            i3 = b.loadInt(30)
+            s = b.loadString("Fizz")
+            b.buildSwitch(on: i1) { cases in
+                // Splicing will only be possible if we allow variables from the original program
+                // to be remapped to variables in the host program, so set mergeDataFlow to true.
+                #expect(b.splice(from: original, at: splicePoint, mergeDataFlow: true))
+                #expect(b.splice(from: original, mergeDataFlow: true))
+            }
+            let result = b.finalize()
+            #expect(result.code.contains(where: { $0.op is BeginSwitchCase }))
+        }
+    }
+
+    @Test func testArgumentGenerationForKnownSignature() {
+        let env = JavaScriptEnvironment()
+        let fuzzer = makeMockFuzzer(environment: env)
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            b.loadInt(42)
+
+            let constructor = b.createNamedVariable(forBuiltin: "DataView")
+            let signature = env.type(ofBuiltin: "DataView").signature!
+
+            let variables = b.findOrGenerateArguments(forSignature: signature)
+
+            #expect(b.type(of: variables[0]).Is(.object(ofGroup: "ArrayBuffer")))
+            if variables.count > 1 {
+                #expect(b.type(of: variables[1]).Is(.number))
+            }
+
+            b.construct(constructor, withArgs: variables)
+        }
+    }
+
+    @Test func testArgumentGenerationForKnownSignatureWithLimit() {
+        let env = JavaScriptEnvironment()
+        let config = Configuration(logLevel: .error)
+        let fuzzer = makeMockFuzzer(config: config, environment: env)
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            b.loadInt(42)
+
+            let typeA: ILType = .object(withProperties: ["a", "b"])
+            let typeB: ILType = .object(withProperties: ["c", "d"])
+            let typeC: ILType = .object(withProperties: ["e", "f"])
+
+            let signature: Signature = [.plain(typeA), .plain(typeB)] => .undefined
+            let signature2: Signature = [.plain(typeC), .plain(typeC)] => .undefined
+
+            var args = b.findOrGenerateArguments(forSignature: signature)
+            #expect(args.count == 2)
+
+            // check that args have the right types
+            #expect(b.type(of: args[0]).Is(typeA))
+            #expect(b.type(of: args[1]).Is(typeB))
+
+            let previous = b.numberOfVisibleVariables
+
+            args = b.findOrGenerateArguments(
+                forSignature: signature2, maxNumberOfVariablesToGenerate: 1)
+            #expect(args.count == 2)
+
+            // Ensure first object has the right type, and that we only generated one more variable
+            #expect(b.type(of: args[0]).Is(typeC))
+            #expect(b.numberOfVisibleVariables == previous + 1)
+        }
+    }
+
+    @Test func testFindOrGenerateTypeWorksRecursively() {
+        // Types
+        let jsD8 = ILType.object(ofGroup: "D8", withProperties: ["test"], withMethods: [])
+        let jsD8Test = ILType.object(
+            ofGroup: "D8Test", withProperties: ["FastCAPI"], withMethods: [])
+        let jsD8FastCAPI = ILType.object(
+            ofGroup: "D8FastCAPI", withProperties: [],
+            withMethods: ["throw_no_fallback", "add_32bit_int"])
+        let jsD8FastCAPIConstructor = ILType.constructor([] => jsD8FastCAPI)
+
+        // Object groups
+        let jsD8Group = ObjectGroup(
+            name: "D8", instanceType: jsD8, properties: ["test": jsD8Test], methods: [:])
+        let jsD8TestGroup = ObjectGroup(
+            name: "D8Test", instanceType: jsD8Test,
+            properties: ["FastCAPI": jsD8FastCAPIConstructor], methods: [:])
+        let jsD8FastCAPIGroup = ObjectGroup(
+            name: "D8FastCAPI", instanceType: jsD8FastCAPI, properties: [:],
+            methods: [
+                "throw_no_fallback": [] => ILType.integer,
+                "add_32bit_int": [.integer, .integer] => .integer,
+            ])
+        let additionalObjectGroups = [jsD8Group, jsD8TestGroup, jsD8FastCAPIGroup]
+
+        let env = JavaScriptEnvironment(
+            additionalBuiltins: ["d8": jsD8], additionalObjectGroups: additionalObjectGroups)
+        let config = Configuration(logLevel: .error)
+        let fuzzer = makeMockFuzzer(config: config, environment: env)
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+            b.buildPrefix()
+            // This has to generate `new d8.test.D8FastCAPI()`
+            let d8FastCAPIObj = b.findOrGenerateType(jsD8FastCAPI)
+            #expect(b.type(of: d8FastCAPIObj).Is(jsD8FastCAPI))
+
+            // Check that the intermediate variables were generated as part of the recursion.
+            let d8 = b.randomVariable(ofType: jsD8)
+            #expect(d8 != nil && b.type(of: d8!).Is(jsD8))
+
+            let d8Test = b.randomVariable(ofType: jsD8Test)
+            #expect(d8Test != nil && b.type(of: d8Test!).Is(jsD8Test))
+        }
+    }
+
+    @Test func testFindOrGenerateTypeWithGlobalConstructor() {
+        let objType = ILType.object(ofGroup: "Test", withProperties: [], withMethods: [])
+        let constructor = ILType.constructor([] => objType)
+
+        let testGroup = ObjectGroup(
+            name: "Test", instanceType: objType, properties: [:], methods: [:])
+
+        let env = JavaScriptEnvironment(
+            additionalBuiltins: ["myBuiltin": constructor], additionalObjectGroups: [testGroup])
+        let config = Configuration(logLevel: .error)
+        let fuzzer = makeMockFuzzer(config: config, environment: env)
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+            b.buildPrefix()
+
+            let obj = b.findOrGenerateType(objType)
+            #expect(b.type(of: obj).Is(objType))
+        }
+    }
+
+    @Test func testFindOrGenerateTypeWithMethod() {
+        // Types
+        let jsD8 = ILType.object(ofGroup: "D8", withProperties: [], withMethods: ["test"])
+        let objType = ILType.object(ofGroup: "Test", withProperties: [], withMethods: [])
+
+        // Object groups
+        let jsD8Group = ObjectGroup(
+            name: "D8", instanceType: jsD8, properties: [:], methods: ["test": [] => objType])
+
+        let testGroup = ObjectGroup(
+            name: "Test", instanceType: objType, properties: [:], methods: [:])
+
+        let env = JavaScriptEnvironment(
+            additionalBuiltins: ["d8": jsD8], additionalObjectGroups: [jsD8Group, testGroup])
+        let config = Configuration(logLevel: .error)
+        let fuzzer = makeMockFuzzer(config: config, environment: env)
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+            b.buildPrefix()
+
+            let obj = b.findOrGenerateType(objType)
+            #expect(b.type(of: obj).Is(objType))
+        }
+    }
+
+    @Test func testFindOrGenerateTypeWithMethodOverload() {
+        // Types
+        let jsD8 = ILType.object(ofGroup: "D8", withProperties: [], withMethods: ["test"])
+        let objType = ILType.object(ofGroup: "Test", withProperties: [], withMethods: [])
+
+        // Object groups
+        let jsD8Group = ObjectGroup(
+            name: "D8",
+            instanceType: jsD8,
+            properties: [:],
+            overloads: [
+                "test": [
+                    [.string] => .integer,
+                    [.integer, .integer] => .string,
+                    [] => objType,
+                ]
+            ])
+
+        let testGroup = ObjectGroup(
+            name: "Test", instanceType: objType, properties: [:], methods: [:])
+
+        let env = JavaScriptEnvironment(
+            additionalBuiltins: ["d8": jsD8], additionalObjectGroups: [jsD8Group, testGroup])
+        let config = Configuration(logLevel: .error)
+        let fuzzer = makeMockFuzzer(config: config, environment: env)
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+            b.buildPrefix()
+
+            let obj = b.findOrGenerateType(objType)
+            #expect(b.type(of: obj).Is(objType))
+        }
+    }
+
+    @Test func testRandomVariableOfTypeOrSubtype() {
+        let type1 = ILType.object(ofGroup: "group1", withProperties: [], withMethods: [])
+        let type2 = ILType.object(ofGroup: "group2", withProperties: [], withMethods: [])
+        let type3 = ILType.object(ofGroup: "group3", withProperties: [], withMethods: [])
+        let type4 = ILType.object(ofGroup: "group4", withProperties: [], withMethods: [])
+
+        let group1 = ObjectGroup(name: "group1", instanceType: type1, properties: [:], methods: [:])
+        let group2 = ObjectGroup(
+            name: "group2", instanceType: type2, properties: [:], methods: [:], parent: "group1")
+        let group3 = ObjectGroup(
+            name: "group3", instanceType: type3, properties: [:], methods: [:], parent: "group2")
+        let group4 = ObjectGroup(
+            name: "group4", instanceType: type4, properties: [:], methods: [:], parent: "group3")
+
+        let env = JavaScriptEnvironment(
+            additionalBuiltins: ["type3": type3],
+            additionalObjectGroups: [group1, group2, group3, group4])
+        let config = Configuration(logLevel: .error)
+        let fuzzer = makeMockFuzzer(config: config, environment: env)
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+            b.buildPrefix()
+            let var3 = b.createNamedVariable(forBuiltin: "type3")
+            #expect(b.type(of: var3).Is(type3))
+            // Get a random variable and then change the type
+            let var1 = b.randomVariable(ofTypeOrSubtype: type1)
+            #expect(var1 != nil)
+            #expect(var1 == var3)
+            let var4 = b.randomVariable(ofTypeOrSubtype: type4)
+            #expect(var4 == nil)
+        }
+    }
+
+    @Test func testFindOrGenerateTypeWithSubtype() {
+        let type1 = ILType.object(ofGroup: "group1", withProperties: [], withMethods: [])
+        let type2 = ILType.object(ofGroup: "group2", withProperties: [], withMethods: [])
+        let type3 = ILType.object(ofGroup: "group3", withProperties: [], withMethods: [])
+        let type4 = ILType.object(ofGroup: "group4", withProperties: [], withMethods: [])
+
+        let type4Constructor = ILType.constructor([] => type4)
+
+        let group1 = ObjectGroup(name: "group1", instanceType: type1, properties: [:], methods: [:])
+        let group2 = ObjectGroup(
+            name: "group2", instanceType: type2, properties: [:], methods: [:], parent: "group1")
+        let group3 = ObjectGroup(
+            name: "group3", instanceType: type3, properties: [:], methods: [:], parent: "group2")
+        let group4 = ObjectGroup(
+            name: "group4", instanceType: type4, properties: [:], methods: [:], parent: "group3")
+
+        let env = JavaScriptEnvironment(
+            additionalBuiltins: ["group4": type4Constructor],
+            additionalObjectGroups: [group1, group2, group3, group4])
+        let config = Configuration(logLevel: .error)
+        let fuzzer = makeMockFuzzer(config: config, environment: env)
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+            b.buildPrefix()
+            // Get a random variable and then change the type
+
+            let obj = b.findOrGenerateType(type1)
+            #expect(b.type(of: obj).Is(type4))
+        }
+    }
+
+    @Test func testFindOrGenerateTypeWithSubtypeWithMethod() {
+        let type1 = ILType.object(ofGroup: "group1", withProperties: [], withMethods: [])
+        let type2 = ILType.object(ofGroup: "group2", withProperties: [], withMethods: [])
+        let type3 = ILType.object(ofGroup: "group3", withProperties: [], withMethods: [])
+        let type4 = ILType.object(ofGroup: "group4", withProperties: [], withMethods: ["method3"])
+
+        let type4Constructor = ILType.constructor([] => type4)
+
+        let group1 = ObjectGroup(name: "group1", instanceType: type1, properties: [:], methods: [:])
+        let group2 = ObjectGroup(
+            name: "group2", instanceType: type2, properties: [:], methods: [:], parent: "group1")
+        let group3 = ObjectGroup(
+            name: "group3", instanceType: type3, properties: [:], methods: [:], parent: "group2")
+        let group4 = ObjectGroup(
+            name: "group4", instanceType: type4, properties: [:],
+            methods: [
+                "method3": [] => type3
+            ])
+
+        let env = JavaScriptEnvironment(
+            additionalBuiltins: ["group4": type4Constructor],
+            additionalObjectGroups: [group1, group2, group3, group4])
+        let config = Configuration(logLevel: .error)
+        let fuzzer = makeMockFuzzer(config: config, environment: env)
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+            b.buildPrefix()
+            // Get a random variable and then change the type
+
+            let obj = b.findOrGenerateType(type1)
+            #expect(b.type(of: obj).Is(type3))
+        }
+    }
+
+    @Test func testFindOrGenerateTypeEnum() {
+        let allowedValues = ["hello", "world", "foo", "bar"]
+
+        let enumType = ILType.enumeration(ofName: "myEnum", withValues: allowedValues)
+        let env = JavaScriptEnvironment()
+        let config = Configuration(logLevel: .error)
+        let fuzzer = makeMockFuzzer(config: config, environment: env)
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+            b.buildPrefix()
+            // Get a random variable and then change the type
+
+            let obj = b.findOrGenerateType(enumType)
+            #expect(b.type(of: obj).Is(.string))
+            let program = b.finalize()
+            var analyzer = DefUseAnalyzer(for: program)
+            analyzer.analyze()
+            let instruction = analyzer.definition(of: obj)
+            switch instruction.op.opcode {
+            case .loadString(let value):
+                #expect(allowedValues.contains(value.value))
+            default:
+                Issue.record("Unexpected instruction")
+            }
+        }
+    }
+
+    @Test func testFindOrGenerateTypeParameterizedIterable() {
+        let env = JavaScriptEnvironment()
+        let config = Configuration(logLevel: .error)
+        let fuzzer = makeMockFuzzer(config: config, environment: env)
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+            let strIterableType = ILType.iterable(ofElementType: .jsString)
+
+            // To prevent crash on assert that there are visible variables
+            b.loadString("foo")
+
+            _ = b.findOrGenerateType(strIterableType)
+            let instruction = b.lastInstruction()
+            #expect(instruction.op is CreateArray)
+            #expect(instruction.numInputs == 1)
+            #expect(b.type(of: instruction.inputs[0]).Is(.jsString))
+        }
+    }
+
+    @Test func testFindOrGenerateWithCodeGenerator() {
+        let type1 = ILType.object(ofGroup: "group1", withProperties: [], withMethods: [])
+        let group1 = ObjectGroup(name: "group1", instanceType: type1, properties: [:], methods: [:])
+
+        let testGenerator = CodeGenerator("testGenerator", produces: [type1]) { b in
+            let builtin = b.createNamedVariable(forBuiltin: "foo")
+            b.callFunction(builtin)
+        }
+
+        let env = JavaScriptEnvironment(
+            additionalBuiltins: ["foo": .function([] => type1)],
+            additionalObjectGroups: [group1])
+        let config = Configuration(logLevel: .error)
+        let fuzzer = makeMockFuzzer(
+            config: config, environment: env, codeGenerators: [(testGenerator, 1)])
+
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+            // Manually create a Variable, we don't want to use buildPrefix as we then might accidentally already create variable of type `type1`.
+            b.loadInt(42)
+
+            #expect(b.randomVariable(ofTypeOrSubtype: type1) == nil)
+            let obj = b.findOrGenerateType(type1)
+            #expect(b.type(of: obj).Is(type1))
+        }
+    }
+
+    @Test func testCodeGeneratorWithPreferredInputDependencyResolution() {
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            let myType = ILType.object(withProperties: ["MyProperty"])
+
+            var producingGeneratorRan = false
+            let producingGenerator = CodeGenerator(
+                "ProducingGenerator", produces: [myType], useInPrefix: true
+            ) { b in
+                producingGeneratorRan = true
+                let obj = b.createObject(with: [:])
+                b.setProperty("MyProperty", of: obj, to: b.loadInt(42))
+            }
+
+            var consumingGeneratorRan = false
+            let consumingGenerator = CodeGenerator("ConsumingGenerator", inputs: .preferred(myType))
+            { b, arg in
+                consumingGeneratorRan = true
+            }
+
+            fuzzer.setCodeGenerators(
+                WeightedList<CodeGenerator>([
+                    (producingGenerator, 1),
+                    (consumingGenerator, 1),
+                ]))
+
+            // Add some visible variables to prevent assert failures
+            b.loadInt(42)
+
+            // Schedule `consumingGenerator`. It requires myType, which is only produced by `producingGenerator`
+            // This should cause `producingGenerator` to be scheduled and run.
+            let syntheticGenerator = b.assembleSyntheticGenerator(for: consumingGenerator)!
+
+            let _ = b.complete(generator: syntheticGenerator, withBudget: 10)
+
+            #expect(producingGeneratorRan)
+            #expect(consumingGeneratorRan)
+        }
+    }
+
+    @Test func testWasmTypeGroupScoping() {
+        let env = JavaScriptEnvironment()
+        let config = Configuration(logLevel: .error)
+        let fuzzer = makeMockFuzzer(config: config, environment: env)
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            let typesA = b.wasmDefineTypeGroup(recursiveGenerator: {
+                b.wasmDefineArrayType(elementType: .wasmi32, mutability: true)
+            })
+
+            #expect(typesA.count == 1)
+
+            let typesB = b.wasmDefineTypeGroup(recursiveGenerator: {
+                b.wasmDefineArrayType(elementType: .wasmi32, mutability: true)
+            })
+
+            #expect(typesB.count == 1)
+        }
+    }
+
+    // TODO(pawkra): check shared subtyping once we support more shared refs.
+    @Test func testWasmGCSubtyping() {
+        let env = JavaScriptEnvironment()
+        let config = Configuration(logLevel: .error)
+        let fuzzer = makeMockFuzzer(config: config, environment: env)
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            let typeGroupA = b.wasmDefineTypeGroup {
+                [
+                    b.wasmDefineArrayType(elementType: .wasmi32, mutability: true),
+                    b.wasmDefineStructType(
+                        fields: [.init(type: .wasmi64, mutability: false)], indexTypes: []),
+                ]
+            }
+            let arrayDefI32 = typeGroupA[0]
+            let structDef = typeGroupA[1]
+            let arrayDefI32B = b.wasmDefineTypeGroup {
+                [b.wasmDefineArrayType(elementType: .wasmi32, mutability: true)]
+            }[0]
+
+            let arrayDefI32Type = b.type(of: arrayDefI32)
+            let structDefType = b.type(of: structDef)
+            let arrayDefI32BType = b.type(of: arrayDefI32B)
+
+            #expect(arrayDefI32Type.Is(.wasmTypeDef()))
+            #expect(structDefType.Is(.wasmTypeDef()))
+            #expect(arrayDefI32BType.Is(.wasmTypeDef()))
+            // The type of a type definition may not be confused with the type of an instance of such
+            // struct / array.
+            #expect(!arrayDefI32Type.Is(.wasmGenericRef))
+            #expect(!structDefType.Is(.wasmGenericRef))
+            #expect(!arrayDefI32BType.Is(.wasmGenericRef))
+
+            b.buildWasmModule { wasmModule in
+                wasmModule.addWasmFunction(with: [.wasmi32] => []) { function, label, args in
+                    let arrayI32 = function.wasmArrayNewFixed(arrayType: arrayDefI32, elements: [])
+                    let arrayI32Type = b.type(of: arrayI32)
+                    #expect(arrayI32Type.Is(.wasmRef(.Index(), nullability: true)))
+                    #expect(arrayI32Type.Is(.wasmRef(.Index(), nullability: false)))
+                    #expect(arrayI32Type.Is(.wasmRef(.WasmArray, nullability: true)))
+                    #expect(arrayI32Type.Is(.wasmRef(.WasmArray, nullability: false)))
+                    #expect(arrayI32Type.Is(.wasmRef(.WasmEq, nullability: true)))
+                    #expect(arrayI32Type.Is(.wasmRef(.WasmEq, nullability: false)))
+                    #expect(arrayI32Type.Is(.wasmRef(.WasmAny, nullability: true)))
+                    #expect(arrayI32Type.Is(.wasmRef(.WasmAny, nullability: false)))
+                    #expect(!arrayI32Type.Is(.wasmRef(.WasmStruct, nullability: true)))
+                    #expect(!arrayI32Type.Is(.wasmRef(.WasmStruct, nullability: false)))
+                    #expect(!arrayI32Type.Is(.wasmRef(.WasmExn, nullability: false)))
+
+                    let arrayI32B = function.wasmArrayNewFixed(
+                        arrayType: arrayDefI32B, elements: [])
+                    let arrayI32BType = b.type(of: arrayI32B)
+                    #expect(!arrayI32BType.Is(arrayI32Type))
+                    #expect(!arrayI32Type.Is(arrayI32BType))
+                    let refArrayType = ILType.wasmRef(.WasmArray, nullability: false)
+                    #expect(arrayI32Type.union(with: arrayI32BType) == refArrayType)
+                    #expect(arrayI32BType.union(with: arrayI32Type) == refArrayType)
+                    #expect(arrayI32Type.intersection(with: arrayI32BType) == .nothing)
+                    #expect(arrayI32BType.intersection(with: arrayI32Type) == .nothing)
+
+                    let structVar = function.wasmStructNewDefault(structType: structDef)
+                    let structType = b.type(of: structVar)
+                    #expect(structType.Is(.wasmRef(.Index(), nullability: true)))
+                    #expect(structType.Is(.wasmRef(.Index(), nullability: false)))
+                    #expect(structType.Is(.wasmRef(.WasmStruct, nullability: false)))
+                    #expect(structType.Is(.wasmRef(.WasmEq, nullability: false)))
+                    #expect(structType.Is(.wasmRef(.WasmAny, nullability: false)))
+                    #expect(!structType.Is(.wasmRef(.WasmArray, nullability: true)))
+                    #expect(!structType.Is(.wasmRef(.WasmArray, nullability: false)))
+                    #expect(!structType.Is(.wasmRef(.WasmExn, nullability: false)))
+
+                    let refEqType = ILType.wasmRef(.WasmEq, nullability: false)
+                    #expect(structType.union(with: arrayI32Type) == refEqType)
+                    #expect(arrayI32Type.union(with: structType) == refEqType)
+                    #expect(structType.intersection(with: arrayI32Type) == .nothing)
+                    #expect(arrayI32Type.intersection(with: structType) == .nothing)
+
+                    let i31 = function.wasmRefI31(function.consti32(42))
+                    let i31Type = b.type(of: i31)
+                    #expect(!i31Type.Is(.wasmRef(.Index(), nullability: true)))
+                    #expect(i31Type.Is(.wasmRef(.WasmEq, nullability: false)))
+                    #expect(i31Type.Is(.wasmRef(.WasmAny, nullability: false)))
+                    #expect(!i31Type.Is(.wasmRef(.WasmArray, nullability: false)))
+                    #expect(!i31Type.Is(.wasmRef(.WasmStruct, nullability: false)))
+                    #expect(!i31Type.Is(.wasmRef(.WasmExn, nullability: false)))
+
+                    #expect(structType.union(with: i31Type) == refEqType)
+                    #expect(arrayI32Type.union(with: i31Type) == refEqType)
+                    #expect(i31Type.union(with: refEqType) == refEqType)
+                    #expect(refArrayType.union(with: i31Type) == refEqType)
+                    let refStructType = ILType.wasmRef(.WasmStruct, nullability: false)
+                    #expect(i31Type.union(with: refStructType) == refEqType)
+
+                    #expect(i31Type.intersection(with: refEqType) == i31Type)
+                    #expect(refEqType.intersection(with: i31Type) == i31Type)
+                    let refNone = ILType.wasmRef(.WasmNone, nullability: false)
+                    #expect(i31Type.intersection(with: refArrayType) == refNone)
+                    #expect(refStructType.intersection(with: i31Type) == refNone)
+                    #expect(i31Type.intersection(with: .wasmExnRef()) == .nothing)
+
+                    return []
+                }
+            }
+        }
+    }
+
+    @Test func testWasmArraySubtypeGeneration() {
+        let env = JavaScriptEnvironment()
+        let config = Configuration(logLevel: .error)
+        let fuzzer = makeMockFuzzer(config: config, environment: env)
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            b.wasmDefineTypeGroup {
+                let baseStruct = b.wasmDefineStructType(
+                    fields: [.init(type: .wasmi32, mutability: false)], indexTypes: [])
+                let subStruct = b.generateSubtype(for: baseStruct)
+
+                let baseArray = b.wasmDefineArrayType(
+                    elementType: ILType.wasmRef(.Index(), nullability: true), mutability: false,
+                    indexType: baseStruct)
+
+                let abstractBaseArray = b.wasmDefineArrayType(
+                    elementType: ILType.wasmRef(.WasmAny, nullability: true), mutability: false)
+
+                let subArrays = (0..<20).map { _ in b.generateSubtype(for: baseArray) }
+                let subAbstractArrays = (0..<20).map { _ in
+                    b.generateSubtype(for: abstractBaseArray)
+                }
+
+                let subArraysTypeDescriptions = subArrays.map {
+                    b.type(of: $0).wasmTypeDefinition!.description as! WasmArrayTypeDescription
+                }
+                let subAbstractArraysTypeDescriptions = subAbstractArrays.map {
+                    b.type(of: $0).wasmTypeDefinition!.description as! WasmArrayTypeDescription
+                }
+
+                #expect(
+                    subArraysTypeDescriptions.allSatisfy {
+                        $0.concreteHeapSupertype
+                            == b.type(of: baseArray).wasmTypeDefinition?.description
+                    })
+                #expect(
+                    subAbstractArraysTypeDescriptions.allSatisfy {
+                        $0.concreteHeapSupertype
+                            == b.type(of: abstractBaseArray).wasmTypeDefinition?.description
+                    })
+
+                #expect(subArraysTypeDescriptions.allSatisfy { !$0.mutability })
+                #expect(
+                    subArraysTypeDescriptions.contains {
+                        $0.elementType.wasmReferenceType?.nullability == true
+                    })
+                #expect(
+                    subArraysTypeDescriptions.contains {
+                        $0.elementType.wasmReferenceType?.nullability == false
+                    })
+
+                #expect(subAbstractArraysTypeDescriptions.allSatisfy { !$0.mutability })
+                #expect(
+                    subAbstractArraysTypeDescriptions.contains {
+                        $0.elementType.wasmReferenceType?.nullability == true
+                    })
+                #expect(
+                    subAbstractArraysTypeDescriptions.contains {
+                        $0.elementType.wasmReferenceType?.nullability == false
+                    })
+
+                let baseStructDesc = b.type(of: baseStruct).wasmTypeDefinition!.description!
+                let subStructDesc = b.type(of: subStruct).wasmTypeDefinition!.description!
+
+                #expect(
+                    subArraysTypeDescriptions.contains {
+                        if case .Index(let target, _) = $0.elementType.wasmReferenceType?.kind {
+                            return target.get() == subStructDesc
+                        }
+                        return false
+                    })
+                #expect(
+                    subArraysTypeDescriptions.contains {
+                        if case .Index(let target, _) = $0.elementType.wasmReferenceType?.kind {
+                            return target.get() == baseStructDesc
+                        }
+                        return false
+                    })
+
+                #expect(
+                    subAbstractArraysTypeDescriptions.contains {
+                        $0.elementType.wasmReferenceType?.isAbstract() == true
+                    })
+                #expect(
+                    subAbstractArraysTypeDescriptions.contains {
+                        $0.elementType.wasmReferenceType?.isAbstract() == false
+                    })
+
+                return [baseStruct, subStruct, baseArray, abstractBaseArray] + subArrays
+                    + subAbstractArrays
+            }
+        }
+    }
+
+    @Test func testWasmStructSubtypeGeneration() {
+        let env = JavaScriptEnvironment()
+        let config = Configuration(logLevel: .error)
+        let fuzzer = makeMockFuzzer(config: config, environment: env)
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            b.wasmDefineTypeGroup { () -> [Variable] in
+                let innerStruct = b.wasmDefineStructType(
+                    fields: [.init(type: .wasmi32, mutability: false)], indexTypes: [])
+                let subInnerStruct = b.generateSubtype(for: innerStruct)
+                let outerStruct = b.wasmDefineStructType(
+                    fields: [
+                        .init(type: ILType.wasmRef(.Index(), nullability: true), mutability: false),
+                        .init(type: ILType.wasmRef(.WasmAny, nullability: true), mutability: false),
+                    ],
+                    indexTypes: [innerStruct])
+
+                let subOuterStructs = (0..<20).map { _ in b.generateSubtype(for: outerStruct) }
+                let subOuterStructsTypeDescriptions = subOuterStructs.map {
+                    b.type(of: $0).wasmTypeDefinition!.description as! WasmStructTypeDescription
+                }
+
+                #expect(
+                    subOuterStructsTypeDescriptions.allSatisfy {
+                        $0.concreteHeapSupertype
+                            == b.type(of: outerStruct).wasmTypeDefinition?.description
+                    })
+
+                // Width subtyping
+                #expect(subOuterStructsTypeDescriptions.contains { $0.fields.count == 2 })
+                #expect(subOuterStructsTypeDescriptions.contains { $0.fields.count > 2 })
+
+                // Depth subtyping
+                let innerStructDesc = b.type(of: innerStruct).wasmTypeDefinition!.description!
+                let subInnerStructDesc = b.type(of: subInnerStruct).wasmTypeDefinition!.description!
+
+                #expect(
+                    subOuterStructsTypeDescriptions.contains {
+                        if case .Index(let target, _) = $0.fields[0].type.wasmReferenceType?.kind {
+                            return target.get() == subInnerStructDesc
+                        }
+                        return false
+                    })
+                #expect(
+                    subOuterStructsTypeDescriptions.contains {
+                        if case .Index(let target, _) = $0.fields[0].type.wasmReferenceType?.kind {
+                            return target.get() == innerStructDesc
+                        }
+                        return false
+                    })
+
+                #expect(
+                    subOuterStructsTypeDescriptions.contains {
+                        $0.fields[1].type.wasmReferenceType?.isAbstract() == true
+                    })
+                #expect(
+                    subOuterStructsTypeDescriptions.contains {
+                        $0.fields[1].type.wasmReferenceType?.isAbstract() == false
+                    })
+
+                return [innerStruct, subInnerStruct, outerStruct] + subOuterStructs
+            }
+        }
+    }
+
+    @Test func testWasmSignatureSubtypeGeneration() {
+        let env = JavaScriptEnvironment()
+        let config = Configuration(logLevel: .error)
+        let fuzzer = makeMockFuzzer(config: config, environment: env)
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            b.wasmDefineTypeGroup { () -> [Variable] in
+                let structType = b.wasmDefineStructType(
+                    fields: [.init(type: .wasmi32, mutability: false)], indexTypes: [])
+                let subStructType = b.generateSubtype(for: structType)
+                let baseSignatureType = b.wasmDefineSignatureType(
+                    signature: [
+                        ILType.wasmRef(.Index(), nullability: true),
+                        ILType.wasmRef(.WasmEq, nullability: true),
+                    ] => [
+                        ILType.wasmRef(.Index(), nullability: true),
+                        ILType.wasmRef(.WasmAny, nullability: true),
+                    ],
+                    indexTypes: [subStructType, structType])
+
+                let subSignatureTypes = (0..<20).map { _ in
+                    b.generateSubtype(for: baseSignatureType)
+                }
+                let subSignatureTypeDescriptions = subSignatureTypes.map {
+                    b.type(of: $0).wasmTypeDefinition!.description as! WasmSignatureTypeDescription
+                }
+
+                #expect(
+                    subSignatureTypeDescriptions.allSatisfy {
+                        $0.concreteHeapSupertype
+                            == b.type(of: baseSignatureType).wasmTypeDefinition?.description
+                    })
+
+                let structTypeDescription = b.type(of: structType).wasmTypeDefinition!.description!
+                let subStructTypeDescription = b.type(of: subStructType).wasmTypeDefinition!
+                    .description!
+
+                // Parameters are contravariant
+                #expect(
+                    subSignatureTypeDescriptions.contains {
+                        if case .Index(let target, _) = $0.signature.parameterTypes[0]
+                            .wasmReferenceType?.kind
+                        {
+                            return target.get() == structTypeDescription
+                        }
+                        return false
+                    })
+                #expect(
+                    subSignatureTypeDescriptions.contains {
+                        if case .Index(let target, _) = $0.signature.parameterTypes[0]
+                            .wasmReferenceType?.kind
+                        {
+                            return target.get() == subStructTypeDescription
+                        }
+                        return false
+                    })
+
+                #expect(
+                    subSignatureTypeDescriptions.contains {
+                        $0.signature.parameterTypes[1] == ILType.wasmRef(.WasmEq, nullability: true)
+                    })
+                #expect(
+                    subSignatureTypeDescriptions.contains {
+                        $0.signature.parameterTypes[1]
+                            == ILType.wasmRef(.WasmAny, nullability: true)
+                    })
+
+                // Outputs are covariant
+                #expect(
+                    subSignatureTypeDescriptions.contains {
+                        if case .Index(let target, _) = $0.signature.outputTypes[0]
+                            .wasmReferenceType?
+                            .kind
+                        {
+                            return target.get() == subStructTypeDescription
+                        }
+                        return false
+                    })
+                #expect(
+                    subSignatureTypeDescriptions.contains {
+                        if case .Index(let target, _) = $0.signature.outputTypes[0]
+                            .wasmReferenceType?
+                            .kind
+                        {
+                            return target.get() == structTypeDescription
+                        }
+                        return false
+                    })
+
+                #expect(
+                    subSignatureTypeDescriptions.contains {
+                        $0.signature.outputTypes[1].wasmReferenceType?.isAbstract() == true
+                    })
+                #expect(
+                    subSignatureTypeDescriptions.contains {
+                        $0.signature.outputTypes[1].wasmReferenceType?.isAbstract() == false
+                    })
+
+                return [structType, subStructType, baseSignatureType] + subSignatureTypes
+            }
+        }
+    }
+
+    @Test func testEmptyMemoryGenerateMemoryIndices() {
+        let env = JavaScriptEnvironment()
+        let config = Configuration(logLevel: .error)
+        let fuzzer = makeMockFuzzer(config: config, environment: env)
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+            do {
+                let emptyMemory = b.createWasmMemory(minPages: 0)
+                b.buildWasmModule { wasmModule in
+                    wasmModule.addWasmFunction(with: [] => [.wasmi32]) { function, label, args in
+                        let (dynamicOffset, staticOffset) = b.generateAlignedMemoryIndexes(
+                            forMemory: emptyMemory, alignment: 1)
+                        return [
+                            function.wasmMemoryLoad(
+                                memory: emptyMemory,
+                                dynamicOffset: dynamicOffset, loadType: .I32LoadMem,
+                                staticOffset: staticOffset)
+                        ]
+                    }
+                }
+            }
+            let actual = b.finalize()
+            do {
+                let emptyMemory = b.createWasmMemory(minPages: 0)
+                b.buildWasmModule { wasmModule in
+                    wasmModule.addWasmFunction(with: [] => [.wasmi32]) { function, label, args in
+                        return [
+                            function.wasmMemoryLoad(
+                                memory: emptyMemory,
+                                dynamicOffset: function.consti32(0), loadType: .I32LoadMem,
+                                staticOffset: 0)
+                        ]
+                    }
+                }
+            }
+            let expected = b.finalize()
+            #expect(actual == expected)
+        }
+    }
+
+    @Test func testWasmReturnCallDirectGenerator() {
+        // Check that the generator always selects the previously defined,
+        // compatible function and never the current function recursively.
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            let generator = fuzzer.codeGenerators.first {
+                $0.name == "WasmReturnCallDirectGenerator"
+            }!
+
+            var callee: Variable?
+            b.buildWasmModule { wasmModule in
+                callee = wasmModule.addWasmFunction(with: [] => [.wasmI31Ref()]) {
+                    function, label, args in
+                    return [function.wasmRefI31(function.consti32(42))]
+                }
+
+                wasmModule.addWasmFunction(with: [] => [.wasmAnyRef()]) { function, label, args in
+                    let _ = generator.parts[0].run(in: b, with: [])
+                    return [function.wasmRefI31(function.consti32(0))]
+                }
+            }
+
+            let program = b.finalize()
+
+            #expect(
+                program.code.contains(where: { instr in
+                    if case .wasmReturnCallDirect = instr.op.opcode {
+                        return instr.input(0) == callee
+                    } else {
+                        return false
+                    }
+                }))
+        }
+    }
+
+    @Test func testWasmBranchGeneratorSchedulingTest() {
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+            b.buildPrefix()
+
+            // Pick the Branch Generator.
+            let generator = fuzzer.codeGenerators.filter {
+                $0.name == "WasmBranchGenerator"
+            }[0]
+
+            // Now build this.
+            let syntheticGenerator = b.assembleSyntheticGenerator(for: generator)
+            #expect(syntheticGenerator != nil)
+
+            // TODO: Hm I guess we're missing the block generator that produces a label in the CodeGenerator.
+            // See WasmBlockGenerator.
+            // There should be some logic that allows some nesting of a WasmBlockGenerator.
+            let _ = b.complete(generator: syntheticGenerator!, withBudget: 30)
+            // XCTAssertGreaterThan(numGeneratedInstructions, 30)
+        }
+    }
+
+    @Test func testWasmMemorySizeSchedulingTest() {
+        let fuzzer = makeMockFuzzer()
+        let numPrograms = 30
+
+        for _ in 0...numPrograms {
+            fuzzer.sync {
+                let b = fuzzer.makeBuilder()
+                b.buildPrefix()
+
+                let generator = fuzzer.codeGenerators.filter {
+                    $0.name == "WasmMemorySizeGenerator"
+                }[0]
+
+                // Now build this.
+                let syntheticGenerator = b.assembleSyntheticGenerator(for: generator)
+                #expect(syntheticGenerator != nil)
+
+                let N = 30
+                // We might generate a lot more than 30 instructions to fulfill the constraints.
+                let numGeneratedInstructions = b.complete(
+                    generator: syntheticGenerator!, withBudget: N)
+
+                let program = b.finalize()
+
+                #expect(
+                    program.code.contains(where: { instr in
+                        if case .wasmMemorySize = instr.op.opcode {
+                            return true
+                        } else {
+                            return false
+                        }
+                    }))
+                #expect(numGeneratedInstructions > 0)
+            }
+        }
+    }
+
+    @Test func testTypedArrayFromBufferGenerator() {
+        let fuzzer = makeMockFuzzer()
+        let numPrograms = 30
+
+        for _ in 0...numPrograms {
+            fuzzer.sync {
+                let b = fuzzer.makeBuilder()
+                // Instead of loading a prefix, emit a single integer, so that we have a "prefix" but
+                // the prefix does not fulfill the requirements for the generator, yet.
+                b.loadInt(123)
+
+                let generator = fuzzer.codeGenerators.filter {
+                    $0.name == "TypedArrayFromBufferGenerator"
+                }[0]
+
+                // Now build this.
+                let syntheticGenerator = b.assembleSyntheticGenerator(for: generator)
+                #expect(syntheticGenerator != nil)
+
+                let N = 30
+                // We might generate a lot more than 30 instructions to fulfill the constraints.
+                let numGeneratedInstructions = b.complete(
+                    generator: syntheticGenerator!, withBudget: N)
+                #expect(numGeneratedInstructions > 0)
+                // All generator input requirements are fulfilled.
+                #expect(
+                    generator.parts.allSatisfy {
+                        $0.inputs.constraints.allSatisfy {
+                            b.randomVariable(ofType: $0.type) != nil
+                        }
+                    })
+                // All generator `produces` guarantees are fulfilled.
+                #expect(generator.produces.allSatisfy { b.randomVariable(ofType: $0.type) != nil })
+                let _ = b.finalize()
+            }
+        }
+    }
+
+    /// Test that scheduling a dynamic import while in the .bundle context succeeds.
+    @Test func testBundleDynamicImportScheduling() {
+        let config = Configuration(logLevel: .error, generateBundle: true)
+        let fuzzer = makeMockFuzzer(config: config)
+        let numPrograms = 30
+
+        for _ in 0..<numPrograms {
+            fuzzer.sync {
+                let b = fuzzer.makeBuilder()
+
+                let generator = fuzzer.codeGenerators.filter {
+                    $0.name == "DynamicImportGenerator"
+                }[0]
+
+                let syntheticGenerator = b.assembleSyntheticGenerator(for: generator)
+                #expect(syntheticGenerator != nil)
+
+                _ = b.complete(generator: syntheticGenerator!, withBudget: 30)
+                let program = b.finalize()
+
+                #expect(
+                    program.code.contains(where: { instr in
+                        switch instr.op.opcode {
+                        case .dynamicImport(_):
+                            return true
+                        default:
+                            return false
+                        }
+                    }))
+            }
+        }
+    }
+
+    @Test func testWasmGCScheduling() {
+        func test<each ExpectedOp>(
+            _ generatorName: String,
+            expectAny: repeat (each ExpectedOp).Type,
+            requiresTypes: Bool = false
+        ) {
+            let fuzzer = makeMockFuzzer()
+            let numPrograms = 30
+
+            for _ in 0..<numPrograms {
+                fuzzer.sync {
+                    let b = fuzzer.makeBuilder()
+                    b.buildPrefix()
+
+                    // TODO(mliedtke): The mechanism needs to learn how to resolve nested input +
+                    // context dependencies.
+                    if requiresTypes {
+                        b.wasmDefineTypeGroup {
+                            [
+                                b.wasmDefineArrayType(elementType: .wasmi32, mutability: true),
+                                b.wasmDefineStructType(
+                                    fields: [.init(type: .wasmi32, mutability: true)],
+                                    indexTypes: []),
+                            ]
+                        }
+                    }
+
+                    let generator = fuzzer.codeGenerators.filter { $0.name == generatorName }[0]
+                    let syntheticGenerator = b.assembleSyntheticGenerator(for: generator)
+                    #expect(syntheticGenerator != nil)
+
+                    let numGeneratedInstructions = b.complete(
+                        generator: syntheticGenerator!, withBudget: 30)
+                    let program = b.finalize()
+
+                    #expect(
+                        program.code.contains(where: { instr in
+                            for match in repeat instr.op is (each ExpectedOp) {
+                                if match { return true }
+                            }
+                            return false
+                        }), "\(generatorName)")
+                    #expect(numGeneratedInstructions > 0)
+                }
+            }
+        }
+
+        test("WasmArrayNewGenerator", expectAny: WasmArrayNewDefault.self, WasmArrayNewFixed.self)
+        test("WasmStructNewDefaultGenerator", expectAny: WasmStructNewDefault.self)
+        test("WasmArrayGetGenerator", expectAny: WasmArrayGet.self, requiresTypes: true)
+        test("WasmStructGetGenerator", expectAny: WasmStructGet.self, requiresTypes: true)
+        test("WasmThrowRefGenerator", expectAny: WasmThrowRef.self)
+        test("WasmExternConvertAnyGenerator", expectAny: WasmExternConvertAny.self)
+        test("WasmAnyConvertExternGenerator", expectAny: WasmAnyConvertExtern.self)
+    }
+
+    @Test func testWasmHasUnresolvedSelfReferences() throws {
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            let typeGroup = b.wasmDefineTypeGroup {
+                let v0 = b.wasmDefineForwardOrSelfReference()
+                let v1 = b.wasmDefineArrayType(
+                    elementType: .wasmRef(.Index(), nullability: true), mutability: true,
+                    indexType: v0)
+                #expect(
+                    b.type(of: v1).wasmTypeDefinition!.description!.hasUnresolvedSelfReferences())
+
+                let v2 = b.wasmDefineForwardOrSelfReference()
+                let v3 = b.wasmDefineArrayType(
+                    elementType: .wasmRef(.Index(), nullability: true), mutability: true,
+                    indexType: v2)
+                let v4 = b.wasmDefineArrayType(elementType: .wasmi32, mutability: true)
+                b.wasmResolveForwardReference(v2, to: v4)
+                #expect(
+                    !b.type(of: v3).wasmTypeDefinition!.description!.hasUnresolvedSelfReferences())
+
+                let v5 = b.wasmDefineForwardOrSelfReference()
+                let v6 = b.wasmDefineArrayType(
+                    elementType: .wasmRef(.Index(), nullability: true), mutability: true,
+                    indexType: v5)
+                b.wasmResolveForwardReference(v5, to: v6)
+                #expect(
+                    !b.type(of: v6).wasmTypeDefinition!.description!.hasUnresolvedSelfReferences())
+
+                let v7 = b.wasmDefineForwardOrSelfReference()
+                let v8 = b.wasmDefineStructType(
+                    fields: [.init(type: .wasmRef(.Index(), nullability: true), mutability: true)],
+                    indexTypes: [v7])
+                #expect(
+                    b.type(of: v8).wasmTypeDefinition!.description!.hasUnresolvedSelfReferences())
+                b.wasmResolveForwardReference(v7, to: v8)
+                #expect(
+                    !b.type(of: v8).wasmTypeDefinition!.description!.hasUnresolvedSelfReferences())
+
+                let v9 = b.wasmDefineForwardOrSelfReference()
+                let v10 = b.wasmDefineSignatureType(
+                    signature: [.wasmRef(.Index(), nullability: true)] => [], indexTypes: [v9])
+                #expect(
+                    b.type(of: v10).wasmTypeDefinition!.description!.hasUnresolvedSelfReferences())
+                b.wasmResolveForwardReference(v9, to: v10)
+                #expect(
+                    !b.type(of: v10).wasmTypeDefinition!.description!.hasUnresolvedSelfReferences())
+
+                return [v1, v3, v6, v8, v10]
+            }
+
+            // Once a typegroup is finished, it doesn't have any unresolved self references.
+            for typeDefinition in typeGroup {
+                #expect(
+                    !b.type(of: typeDefinition).wasmTypeDefinition!.description!
+                        .hasUnresolvedSelfReferences(), "\(typeDefinition)")
+            }
+        }
+    }
+
+    @Test func testRandomWasmTypeDef() {
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            let arrayTypeDef = b.wasmDefineTypeGroup {
+                [b.wasmDefineArrayType(elementType: .wasmi32, mutability: true)]
+            }[0]
+
+            // Ensure that randomWasmTypeDef() finds the array definition
+            let randomTypeDef = b.randomWasmTypeDef()
+            #expect(randomTypeDef == arrayTypeDef)
+        }
+    }
+
+    @Test func testThatGeneratorsExistAndAreBuildableFromJs() {
+        let fuzzer = makeMockFuzzer()
+        let tries: Int = 10
+
+        var failures: [String: Int] = [:]
+
+        for generator in fuzzer.codeGenerators {
+            fuzzer.sync {
+                let b = fuzzer.makeBuilder()
+                b.buildPrefix()
+
+                if generator.requiredContext.contains(.bundle)
+                    || generator.requiredContext.contains(.moduleTopLevel)
+                {
+                    // Only buildable in the "bundle" configuration.
+                    return
+                }
+                if let syntheticGenerator = b.assembleSyntheticGenerator(for: generator) {
+                    let generatedInstructions = b.complete(
+                        generator: syntheticGenerator, withBudget: 40)
+
+                    if generatedInstructions == 0 {
+                        failures[generator.name, default: 0] += 1
+                    }
+                    #expect(syntheticGenerator.parts.count < 10)
+                } else {
+                    Issue.record(
+                        "Unable to generate synthetic CodeGenerator for \(generator.name) from JS.")
+                }
+            }
+        }
+
+        for (name, failureCount) in failures {
+            if failureCount == tries {
+                // This might fail very sparsely, if so, we might want to check the offending Generator to see if we can improve handling for it.
+                // OTOH this is a fuzzer and we sometimes have weird situations... :)
+                Issue.record("\(name) always failed to complete.")
+            }
+        }
+    }
+
+    @Test func testThatGeneratorsAreBuildableFromBundle() throws {
+        let config = Configuration(logLevel: .error, generateBundle: true)
+        let fuzzer = makeMockFuzzer(config: config)
+        let tries: Int = 10
+
+        var failures: [String: Int] = [:]
+
+        for generator in fuzzer.codeGenerators {
+            fuzzer.sync {
+                let b = fuzzer.makeBuilder()
+                b.buildPrefix()
+
+                if let syntheticGenerator = b.assembleSyntheticGenerator(for: generator) {
+                    let generatedInstructions = b.complete(
+                        generator: syntheticGenerator, withBudget: 40)
+
+                    if generatedInstructions == 0 {
+                        failures[generator.name, default: 0] += 1
+                    }
+                    #expect(syntheticGenerator.parts.count < 10, "for \(generator.name)")
+                } else {
+                    Issue.record(
+                        "Unable to generate synthetic CodeGenerator for \(generator.name) from a bundle."
+                    )
+                }
+            }
+        }
+
+        for (name, failureCount) in failures {
+            if failureCount == tries {
+                // This might fail very sparsely, if so, we might want to check the offending Generator to see if we can improve handling for it.
+                // OTOH this is a fuzzer and we sometimes have weird situations... :)
+                Issue.record("\(name) always failed to complete.")
+            }
+        }
+    }
+
+    @Test func testUnboundFunctionWithImpossibleReceiver() {
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+            b.buildPrefix()
+
+            let f = b.loadUndefined()
+            b.buildIfElse(b.loadBool(true)) {
+                let date = b.createNamedVariable(forBuiltin: "Date")
+                let proto = b.getProperty("prototype", of: date)
+                let getTime = b.getProperty("getTime", of: proto)
+                b.reassign(variable: f, value: getTime)
+            } elseBody: {
+                let regExp = b.createNamedVariable(forBuiltin: "RegExp")
+                let proto = b.getProperty("prototype", of: regExp)
+                let test = b.getProperty("test", of: proto)
+                b.reassign(variable: f, value: test)
+            }
+
+            // There isn't any valid type that is both an instance of Date and an instance of
+            // RegExp, so this type "loses" its receiver information.
+            #expect(b.type(of: f) == .unboundFunction(nil, receiver: nil))
+            let gen = CodeGenerators.first { $0.name == "UnboundFunctionCallGenerator" }!
+            let _ = gen.head.run(in: b, with: [f])
+        }
+    }
+}
+
+struct ProgramBuilderRuntimeDataTests {
+    func runFuzzerWithGenerator(_ generator: CodeGenerator) -> String {
+        let fuzzer = makeMockFuzzer(overwriteGenerators: WeightedList([(generator, 1)]))
+        return fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            let syntheticGenerator = b.assembleSyntheticGenerator(for: generator)
+            #expect(syntheticGenerator != nil)
+            let numInstructions = b.complete(generator: syntheticGenerator!, withBudget: 3)
+            #expect(numInstructions > 0)
+
+            let program = b.finalize()
+            return fuzzer.lifter.lift(program)
+        }
+    }
+
+    @Test func testNested() {
+        let loopGenerator = CodeGenerator(
+            "TestDoWhileLoop",
+            [
+                GeneratorStub("BeginLoop") { b in
+                    let loopVar = b.loadInt(0)
+                    b.runtimeData.push("loopVar", loopVar)
+                    b.emit(BeginDoWhileLoopBody())
+                },
+                GeneratorStub("EndLoop") { b in
+                    let loopVar = b.runtimeData.pop("loopVar")
+                    b.unary(.PreInc, loopVar)
+                    b.emit(BeginDoWhileLoopHeader())
+                    let cond = b.compare(loopVar, with: b.loadInt(3), using: .lessThan)
+                    b.emit(EndDoWhileLoop(), withInputs: [cond])
+                },
+            ])
+        let expected = """
+            let v0 = 0;
+            do {
+                let v2 = 0;
+                do {
+                    ++v2;
+                } while (v2 < 3)
+                ++v0;
+            } while (v0 < 3)
+
+            """
+        #expect(runFuzzerWithGenerator(loopGenerator) == expected)
+    }
+
+    @Test func testMultiLabel() {
+        var counter: Int64 = 0
+        let defineAndAddGenerator = CodeGenerator(
+            "TestMultiLabel",
+            [
+                GeneratorStub("Define") { b in
+                    b.runtimeData.push("first", b.loadInt(counter))
+                    counter += 1
+                    b.runtimeData.push("second", b.loadInt(counter))
+                    counter += 1
+                    b.runtimeData.push("third", b.loadInt(counter))
+                    counter += 1
+                },
+                GeneratorStub("Add") { b in
+                    // The order in which the different lables are popped doesn't matter.
+                    let third = b.runtimeData.pop("third")
+                    let first = b.runtimeData.pop("first")
+                    let second = b.runtimeData.pop("second")
+                    b.binary(b.binary(first, second, with: .Add), third, with: .Add)
+                },
+            ])
+        let expected = """
+            (3 + 4) + 5;
+            (0 + 1) + 2;
+
+            """
+        #expect(runFuzzerWithGenerator(defineAndAddGenerator) == expected)
+    }
+
+    @Test func testPassOn() {
+        var counter: Int64 = 10
+        let defineAndAddGenerator = CodeGenerator(
+            "TestPassOn",
+            [
+                GeneratorStub("Define") { b in
+                    let value = b.loadInt(counter)
+                    b.runtimeData.push("value", value)
+                    b.binary(value, b.loadInt(0), with: .Add)
+                    counter += 1
+                },
+                GeneratorStub("AddOne") { b in
+                    let value = b.runtimeData.peek("value")
+                    b.binary(value, b.loadInt(1), with: .Add)
+                },
+                GeneratorStub("SubOne") { b in
+                    let value = b.runtimeData.pop("value")
+                    b.binary(value, b.loadInt(1), with: .Sub)
+                },
+            ])
+        let expected = """
+            10 + 0;
+            11 + 0;
+            11 + 1;
+            11 - 1;
+            10 + 1;
+            12 + 0;
+            12 + 1;
+            12 - 1;
+            10 - 1;
+
+            """
+        #expect(runFuzzerWithGenerator(defineAndAddGenerator) == expected)
+    }
+
+    @Test func testGeneratorResolutionLoopDetection() {
+        /*
+         * Generator Graph:
+         *
+         * Trigger --> GenRecursionRoot(req: TypeRoot)
+         *
+         * Path (Dead End Cycle): LoopingGenerator(req: TypeLoop, produces: TypeLoop)
+         *
+         * Cycle detection prevents it from repeatedly considering LoopingGenerator.
+         */
+        var calledGenerators = [String]()
+        let typeRoot = ILType.object(ofGroup: "Root")
+        let typeLoop = ILType.object(ofGroup: "Loop")
+
+        let loopingGenerator = CodeGenerator(
+            "LoopingGenerator", inContext: .single(.javascript),
+            inputs: .required(typeLoop), produces: [typeLoop]
+        ) { b, ref in
+            calledGenerators.append("LoopingGenerator")
+        }
+
+        let genRecursionRoot = CodeGenerator(
+            "GenRecursionRoot", inContext: .single(.javascript),
+            inputs: .required(typeLoop), produces: [typeRoot]
+        ) { b, _ in
+            calledGenerators.append("GenRecursionRoot")
+            let v = b.createNamedVariable(forBuiltin: "Root")
+            b.setType(ofVariable: v, to: typeRoot)
+        }
+
+        let fuzzer = makeMockFuzzer(
+            overwriteGenerators: WeightedList<CodeGenerator>([
+                (loopingGenerator, 1), (genRecursionRoot, 1),
+            ]))
+
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+            let _ = b.loadInt(42)
+            let trigger = CodeGenerator(
+                "Trigger", inContext: .single(.javascript), inputs: .required(typeRoot)
+            ) { _, _ in }
+            let plan = b.assembleSyntheticGenerator(for: trigger)
+            if let plan = plan {
+                let _ = b.complete(generator: plan, withBudget: 10)
+            }
+        }
+
+        #expect(calledGenerators.isEmpty)
+    }
+
+    @Test func testGeneratorResolutionTypeCycleDetectionWithFallback() {
+        /*
+         * Generator Graph:
+         *
+         * Trigger --> GenRecursionRoot(req: TypeRoot)
+         *
+         * Path 1 (Cycle):
+         *    LoopingGeneratorB(req: CycleTypeA, produces: CycleTypeB) --> LoopingGeneratorA(req: CycleTypeB, produces: CycleTypeA)
+         * Path 2 (Success):
+         *    FallbackGenerator(Requires 3 trivial types to guarantee it is picked up after path 1 in the queue, produces: CycleTypeA)
+         *
+         * Cycle detection correctly prevents infinite loop in Path 1 and falls back to FallbackGenerator.
+         */
+        var calledGenerators = [String]()
+        let cycleTypeA = ILType.object(ofGroup: "CycleA")
+        let cycleTypeB = ILType.object(ofGroup: "CycleB")
+        let typeRoot = ILType.object(ofGroup: "Root")
+
+        let loopingGeneratorA = CodeGenerator(
+            "LoopingGeneratorA", inContext: .single(.javascript),
+            inputs: .required(cycleTypeB), produces: [cycleTypeA]
+        ) { b, ref in
+            calledGenerators.append("LoopingGeneratorA")
+            let v = b.createNamedVariable(forBuiltin: "CycleA")
+            b.setType(ofVariable: v, to: cycleTypeA)
+        }
+
+        let loopingGeneratorB = CodeGenerator(
+            "LoopingGeneratorB", inContext: .single(.javascript),
+            inputs: .required(cycleTypeA), produces: [cycleTypeB]
+        ) { b, ref in
+            calledGenerators.append("LoopingGeneratorB")
+            let v = b.createNamedVariable(forBuiltin: "CycleB")
+            b.setType(ofVariable: v, to: cycleTypeB)
+        }
+
+        let fallbackGenerator = CodeGenerator(
+            "FallbackGenerator", inContext: .single(.javascript),
+            inputs: .required(.integer, .boolean, .string), produces: [cycleTypeA]
+        ) { b, intVar, boolVar, strVar in
+            calledGenerators.append("FallbackGenerator")
+            let v = b.createNamedVariable(forBuiltin: "FallbackA")
+            b.setType(ofVariable: v, to: cycleTypeA)
+        }
+
+        let genRecursionRoot = CodeGenerator(
+            "GenRecursionRoot", inContext: .single(.javascript),
+            inputs: .required(cycleTypeA), produces: [typeRoot]
+        ) { b, _ in
+            calledGenerators.append("GenRecursionRoot")
+            let v = b.createNamedVariable(forBuiltin: "Root")
+            b.setType(ofVariable: v, to: typeRoot)
+        }
+
+        let triggerGenerator = CodeGenerator(
+            "TriggerGenerator", inContext: .single(.javascript),
+            inputs: .required(typeRoot)
+        ) { b, aVar in }
+
+        let intGen = CodeGenerator("IntGen", inContext: .single(.javascript), produces: [.integer])
+        { b in b.loadInt(42) }
+        let boolGen = CodeGenerator(
+            "BoolGen", inContext: .single(.javascript), produces: [.boolean]
+        ) { b in b.loadBool(true) }
+        let strGen = CodeGenerator("StrGen", inContext: .single(.javascript), produces: [.string]) {
+            b in b.loadString("dummy")
+        }
+
+        let fuzzer = makeMockFuzzer(
+            overwriteGenerators: WeightedList<CodeGenerator>([
+                (loopingGeneratorA, 1),
+                (loopingGeneratorB, 1),
+                (fallbackGenerator, 1),
+                (genRecursionRoot, 1),
+                (intGen, 1),
+                (boolGen, 1),
+                (strGen, 1),
+            ]))
+
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+            let _ = b.loadInt(42)  // To make sure visibleVariables is populated ahead of trigger computation.
+
+            let plan = b.assembleSyntheticGenerator(for: triggerGenerator)
+            #expect(plan != nil)
+            let _ = b.complete(generator: plan!, withBudget: 10)
+        }
+
+        #expect(calledGenerators == ["FallbackGenerator", "GenRecursionRoot"])
+    }
+    @Test func testGeneratorResolutionSharedDependencyNotMistakenForCycle() {
+        /*
+         * Generator Graph:
+         *
+         * Trigger --> GenRecursionRoot(req: TypeA)
+         *
+         *    GeneratorA(req: TypeB, TypeC)
+         *    GeneratorB(req: TypeInt) --> GeneratorInt(no req)
+         *    GeneratorC(req: TypeInt) --> GeneratorInt(no req)
+         *
+         * Both B and C require TypeInt. Searching for TypeInt from C after fulfilling B should NOT be seen as a cycle.
+         */
+        var calledGenerators = [String]()
+        let typeA = ILType.object(ofGroup: "A")
+        let typeB = ILType.object(ofGroup: "B")
+        let typeC = ILType.object(ofGroup: "C")
+        let typeInt = ILType.integer
+        let typeRoot = ILType.object(ofGroup: "Root")
+
+        let genA = CodeGenerator(
+            "GeneratorA", inContext: .single(.javascript),
+            inputs: .required(typeB, typeC), produces: [typeA]
+        ) { b, bVar, cVar in
+            calledGenerators.append("GeneratorA")
+            let v = b.createNamedVariable(forBuiltin: "A")
+            b.setType(ofVariable: v, to: typeA)
+        }
+
+        let genB = CodeGenerator(
+            "GeneratorB", inContext: .single(.javascript),
+            inputs: .required(typeInt), produces: [typeB]
+        ) { b, intVar in
+            calledGenerators.append("GeneratorB")
+            let v = b.createNamedVariable(forBuiltin: "B")
+            b.setType(ofVariable: v, to: typeB)
+        }
+
+        let genC = CodeGenerator(
+            "GeneratorC", inContext: .single(.javascript),
+            inputs: .required(typeInt), produces: [typeC]
+        ) { b, intVar in
+            calledGenerators.append("GeneratorC")
+            let v = b.createNamedVariable(forBuiltin: "C")
+            b.setType(ofVariable: v, to: typeC)
+        }
+
+        let genInt = CodeGenerator(
+            "GeneratorInt", inContext: .single(.javascript),
+            produces: [typeInt]
+        ) { b in
+            calledGenerators.append("GeneratorInt")
+            let v = b.loadInt(42)
+            b.setType(ofVariable: v, to: typeInt)
+        }
+
+        let genRecursionRoot = CodeGenerator(
+            "GenRecursionRoot", inContext: .single(.javascript),
+            inputs: .required(typeA), produces: [typeRoot]
+        ) { b, _ in
+            calledGenerators.append("GenRecursionRoot")
+            let v = b.createNamedVariable(forBuiltin: "Root")
+            b.setType(ofVariable: v, to: typeRoot)
+        }
+
+        let triggerGenerator = CodeGenerator(
+            "TriggerGenerator", inContext: .single(.javascript),
+            inputs: .required(typeRoot)
+        ) { b, aVar in }
+
+        let fuzzer = makeMockFuzzer(
+            overwriteGenerators: WeightedList<CodeGenerator>([
+                (genA, 1),
+                (genB, 1),
+                (genC, 1),
+                (genInt, 1),
+                (genRecursionRoot, 1),
+            ]))
+
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+            let _ = b.loadString("dummy")
+            let plan = b.assembleSyntheticGenerator(for: triggerGenerator)
+            #expect(plan != nil)
+            let _ = b.complete(generator: plan!, withBudget: 10)
+        }
+
+        #expect(calledGenerators.count == 5)
+        #expect(calledGenerators.last == "GenRecursionRoot")
+
+        let iRoot = calledGenerators.firstIndex(of: "GenRecursionRoot")!
+        let iA = calledGenerators.firstIndex(of: "GeneratorA")!
+        let iB = calledGenerators.firstIndex(of: "GeneratorB")!
+        let iC = calledGenerators.firstIndex(of: "GeneratorC")!
+        let iInt = calledGenerators.firstIndex(of: "GeneratorInt")!
+
+        #expect(iInt < iB)
+        #expect(iInt < iC)
+        #expect(iB < iA)
+        #expect(iC < iA)
+        #expect(iA < iRoot)
+    }
+    @Test func testGeneratorResolutionRecursive() throws {
+        /*
+         * Generator Graph:
+         *
+         * Trigger --> GenRecursionRoot(req: .string)
+         *
+         *   GenFloatToString(req: .float, produces: .string)
+         *   GenIntegerToFloat(req: .integer, produces: .float)
+         *   GenInt(no req, produces: .integer)
+         */
+        let fuzzer = makeMockFuzzer()
+        try fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+            let typeInt = ILType.integer
+            let typeFloat = ILType.float
+            let typeString = ILType.string
+            let typeRoot = ILType.object(ofGroup: "Root")
+
+            var calledGenerators = [String]()
+
+            let gPrefix = CodeGenerator("GPrefix", produces: [.undefined], useInPrefix: true) { b in
+                Issue.record("this generator shouldn't be called")
+            }
+
+            let genInt = CodeGenerator("GenInt", produces: [typeInt], useInPrefix: false) { b in
+                calledGenerators.append("GenInt")
+                let v = b.loadInt(42)
+                b.setType(ofVariable: v, to: typeInt)
+            }
+            let genIntegerToFloat = CodeGenerator(
+                "GenIntegerToFloat", inputs: .required(typeInt), produces: [typeFloat]
+            ) { b, _ in
+                calledGenerators.append("GenIntegerToFloat")
+                let v = b.loadFloat(42.0)
+                b.setType(ofVariable: v, to: typeFloat)
+            }
+            let genFloatToString = CodeGenerator(
+                "GenFloatToString", inputs: .required(typeFloat), produces: [typeString]
+            ) { b, _ in
+                calledGenerators.append("GenFloatToString")
+                let v = b.loadString("42")
+                b.setType(ofVariable: v, to: typeString)
+            }
+
+            let genRecursionRoot = CodeGenerator(
+                "GenRecursionRoot", inputs: .required(typeString), produces: [typeRoot]
+            ) { b, _ in
+                calledGenerators.append("GenRecursionRoot")
+                let v = b.createNamedVariable(forBuiltin: "Root")
+                b.setType(ofVariable: v, to: typeRoot)
+            }
+
+            fuzzer.setCodeGenerators(
+                WeightedList<CodeGenerator>([
+                    (gPrefix, 1),
+                    (genInt, 1),
+                    (genIntegerToFloat, 1),
+                    (genFloatToString, 1),
+                    (genRecursionRoot, 1),
+                ]))
+
+            b.loadUndefined()
+
+            let trigger = CodeGenerator("Trigger", inputs: .required(typeRoot)) { _, _ in }
+            let plan = b.assembleSyntheticGenerator(for: trigger)
+            #expect(plan != nil)
+            let _ = b.complete(generator: plan!, withBudget: 10)
+
+            let program = b.finalize()
+            // Make sure everything is present.
+            try #require(program.size == 5)
+            #expect(program.code[0].op is LoadUndefined)
+            #expect(program.code[1].op is LoadInteger)
+            #expect(program.code[2].op is LoadFloat)
+            #expect(program.code[3].op is LoadString)
+
+            #expect(
+                calledGenerators == [
+                    "GenInt", "GenIntegerToFloat", "GenFloatToString", "GenRecursionRoot",
+                ])
+        }
+    }
+
+    @Test func testGeneratorResolutionShortestPath() {
+        /*
+         * Generator Graph:
+         *
+         * Trigger --> GenRecursionRoot(req: TypeA)
+         *
+         * Path 1: GenLongA(req: TypeB) --> GenB(req: TypeC) --> GenC
+         * Path 2: GenShortA(req: TypeD) --> GenD
+         *
+         * The search algorithm schedules Path 2 (shorter depth).
+         */
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+            let typeA = ILType.object(ofGroup: "A")
+            let typeB = ILType.object(ofGroup: "B")
+            let typeC = ILType.object(ofGroup: "C")
+            let typeD = ILType.object(ofGroup: "D")
+
+            var calledGenerators = [String]()
+            let typeRoot = ILType.object(ofGroup: "Root")
+
+            let gPrefix = CodeGenerator("GPrefix", produces: [.undefined], useInPrefix: true) { b in
+                Issue.record("should not be called")
+            }
+
+            // Long path: A requires B, B requires C.
+            let genLongA = CodeGenerator("GenLongA", inputs: .required(typeB), produces: [typeA]) {
+                b, _ in
+                calledGenerators.append("GenLongA")
+                let v = b.createNamedVariable(forBuiltin: "A")
+                b.setType(ofVariable: v, to: typeA)
+            }
+            let genB = CodeGenerator("GenB", inputs: .required(typeC), produces: [typeB]) { b, _ in
+                calledGenerators.append("GenB")
+                let v = b.createNamedVariable(forBuiltin: "B")
+                b.setType(ofVariable: v, to: typeB)
+            }
+            let genC = CodeGenerator("GenC", produces: [typeC]) { b in
+                calledGenerators.append("GenC")
+                let v = b.createNamedVariable(forBuiltin: "C")
+                b.setType(ofVariable: v, to: typeC)
+            }
+
+            // Short path: A requires D.
+            let genShortA = CodeGenerator("GenShortA", inputs: .required(typeD), produces: [typeA])
+            { b, _ in
+                calledGenerators.append("GenShortA")
+                let v = b.createNamedVariable(forBuiltin: "A")
+                b.setType(ofVariable: v, to: typeA)
+            }
+            let genD = CodeGenerator("GenD", produces: [typeD]) { b in
+                calledGenerators.append("GenD")
+                let v = b.createNamedVariable(forBuiltin: "D")
+                b.setType(ofVariable: v, to: typeD)
+            }
+
+            // The unsatisfied requirements of this generator trigger findGeneratorSequence at that one level.
+            let genRecursionRoot = CodeGenerator(
+                "GenRecursionRoot", inputs: .required(typeA), produces: [typeRoot]
+            ) { b, _ in
+                calledGenerators.append("GenRecursionRoot")
+                let v = b.createNamedVariable(forBuiltin: "Root")
+                b.setType(ofVariable: v, to: typeRoot)
+            }
+
+            fuzzer.setCodeGenerators(
+                WeightedList<CodeGenerator>([
+                    (gPrefix, 1), (genLongA, 1), (genB, 1), (genC, 1),
+                    (genShortA, 1), (genD, 1), (genRecursionRoot, 1),
+                ]))
+
+            b.loadInt(42)
+
+            let trigger = CodeGenerator("Trigger", inputs: .required(typeRoot)) { _, _ in }
+            let plan = b.assembleSyntheticGenerator(for: trigger)
+
+            #expect(plan != nil)
+            _ = b.complete(generator: plan!, withBudget: 10)
+
+            #expect(calledGenerators == ["GenD", "GenShortA", "GenRecursionRoot"])
+        }
+    }
+
+    @Test func testGeneratorResolutionDeadEndFallback() {
+        /*
+         * Generator Graph:
+         *
+         * Trigger --> GenRecursionRoot(req: TypeA)
+         *
+         * Path 1: GenX(req: TypeB, TypeC) --> TypeB has no generator
+         * Path 2: GenY(req: TypeC, TypeD, TypeE) --> GenC, GenD, GenE
+         *
+         * Dead end fallback mechanism tries Path 1 (Cost=2), fails, then tries Path 2 (Cost=3) and succeeds.
+         */
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+            let typeA = ILType.object(ofGroup: "A")
+            let typeB = ILType.object(ofGroup: "B")
+            let typeC = ILType.object(ofGroup: "C")
+            let typeD = ILType.object(ofGroup: "D")
+            let typeE = ILType.object(ofGroup: "E")
+
+            var calledGenerators = [String]()
+            let typeRoot = ILType.object(ofGroup: "Root")
+
+            let gPrefix = CodeGenerator("GPrefix", produces: [.undefined], useInPrefix: true) { b in
+                Issue.record("should not be called")
+            }
+
+            // GenX needs B and C. B has no generator.
+            let genX = CodeGenerator("GenX", inputs: .required(typeB, typeC), produces: [typeA]) {
+                b, _, _ in
+                Issue.record("Unexpected call to GenX")
+            }
+
+            // GenY needs C, D, and E (Cost=3) to guarantee it is scheduled after GenX (Cost=2). All have generators.
+            let genY = CodeGenerator(
+                "GenY", inputs: .required(typeC, typeD, typeE), produces: [typeA]
+            ) {
+                b, _, _, _ in
+                calledGenerators.append("GenY")
+                let v = b.createNamedVariable(forBuiltin: "A")
+                b.setType(ofVariable: v, to: typeA)
+            }
+
+            let genC = CodeGenerator("GenC", produces: [typeC]) { b in
+                calledGenerators.append("GenC")
+                let v = b.createNamedVariable(forBuiltin: "C")
+                b.setType(ofVariable: v, to: typeC)
+            }
+            let genD = CodeGenerator("GenD", produces: [typeD]) { b in
+                calledGenerators.append("GenD")
+                let v = b.createNamedVariable(forBuiltin: "D")
+                b.setType(ofVariable: v, to: typeD)
+            }
+            let genE = CodeGenerator("GenE", produces: [typeE]) { b in
+                calledGenerators.append("GenE")
+                let v = b.createNamedVariable(forBuiltin: "E")
+                b.setType(ofVariable: v, to: typeE)
+            }
+
+            // The unsatisfied requirements of this generator trigger findGeneratorSequence at that one level.
+            let genRecursionRoot = CodeGenerator(
+                "GenRecursionRoot", inputs: .required(typeA), produces: [typeRoot]
+            ) { b, _ in
+                calledGenerators.append("GenRecursionRoot")
+                let v = b.createNamedVariable(forBuiltin: "Root")
+                b.setType(ofVariable: v, to: typeRoot)
+            }
+
+            fuzzer.setCodeGenerators(
+                WeightedList<CodeGenerator>([
+                    (gPrefix, 1), (genX, 1), (genY, 1), (genC, 1), (genD, 1), (genE, 1),
+                    (genRecursionRoot, 1),
+                ]))
+
+            b.loadInt(42)
+
+            let trigger = CodeGenerator("Trigger", inputs: .required(typeRoot)) { _, _ in }
+            let plan = b.assembleSyntheticGenerator(for: trigger)
+
+            #expect(plan != nil)
+            _ = b.complete(generator: plan!, withBudget: 10)
+
+            // C, D, E may jitter due to Set non-determinism
+            #expect(calledGenerators.count == 5)
+            #expect(
+                Set(calledGenerators) == [
+                    "GenE", "GenD", "GenC", "GenY", "GenRecursionRoot",
+                ]
+            )
+            #expect(calledGenerators.last == "GenRecursionRoot")
+
+            #expect(
+                calledGenerators.firstIndex(of: "GenY")! > calledGenerators.firstIndex(of: "GenC")!)
+            #expect(
+                calledGenerators.firstIndex(of: "GenY")! > calledGenerators.firstIndex(of: "GenD")!)
+            #expect(
+                calledGenerators.firstIndex(of: "GenY")! > calledGenerators.firstIndex(of: "GenE")!)
+        }
+    }
+
+    @Test func testGeneratorResolutionDeepDeadEndFallback() {
+        /*
+         * Generator Graph:
+         *
+         * Trigger --> GenRecursionRoot(req: TypeA)
+         *
+         * 1. Dead end paths:
+         *    GenX(req: TypeB, TypeC) --> TypeB has no generator
+         *    GenY(req: TypeC, TypeD, TypeE) --> GenD(req: TypeH) -> TypeH has no generator
+         *
+         * 2. Successful path:
+         *    GenZ(req: TypeC, TypeE, TypeF, TypeG)
+         *         |--> GenC, GenE, GenF, GenG (all have no req)
+         *
+         * GenRecursionRoot will try GenX first, then GenY, hit dead-ends on both, and successfully fallback to GenZ.
+         */
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+            let typeA = ILType.object(ofGroup: "A")
+            let typeB = ILType.object(ofGroup: "B")
+            let typeC = ILType.object(ofGroup: "C")
+            let typeD = ILType.object(ofGroup: "D")
+            let typeE = ILType.object(ofGroup: "E")
+            let typeF = ILType.object(ofGroup: "F")
+            let typeG = ILType.object(ofGroup: "G")
+            let typeH = ILType.object(ofGroup: "H")
+            let typeRoot = ILType.object(ofGroup: "Root")
+
+            var calledGenerators = [String]()
+
+            let gPrefix = CodeGenerator("GPrefix", produces: [.undefined], useInPrefix: true) { b in
+                Issue.record("should not be called")
+            }
+
+            // GenX needs B and C. B has no generator.
+            let genX = CodeGenerator("GenX", inputs: .required(typeB, typeC), produces: [typeA]) {
+                b, _, _ in
+                Issue.record("Unexpected call to GenX")
+            }
+
+            // GenY needs C, D, E. D needs H. H has no generator.
+            let genY = CodeGenerator(
+                "GenY", inputs: .required(typeC, typeD, typeE), produces: [typeA]
+            ) { b, _, _, _ in
+                Issue.record("Unexpected call to GenY")
+            }
+            let genD = CodeGenerator("GenD", inputs: .required(typeH), produces: [typeD]) { b, _ in
+                Issue.record("Unexpected call to GenD")
+            }
+
+            // GenZ needs C, E, F, G. All have generators.
+            let genZ = CodeGenerator(
+                "GenZ", inputs: .required(typeC, typeE, typeF, typeG), produces: [typeA]
+            ) { b, _, _, _, _ in
+                calledGenerators.append("GenZ")
+                let v = b.createNamedVariable(forBuiltin: "A")
+                b.setType(ofVariable: v, to: typeA)
+            }
+
+            let genC = CodeGenerator("GenC", produces: [typeC]) { b in
+                calledGenerators.append("GenC")
+                let v = b.createNamedVariable(forBuiltin: "C")
+                b.setType(ofVariable: v, to: typeC)
+            }
+            let genE = CodeGenerator("GenE", produces: [typeE]) { b in
+                calledGenerators.append("GenE")
+                let v = b.createNamedVariable(forBuiltin: "E")
+                b.setType(ofVariable: v, to: typeE)
+            }
+            let genF = CodeGenerator("GenF", produces: [typeF]) { b in
+                calledGenerators.append("GenF")
+                let v = b.createNamedVariable(forBuiltin: "F")
+                b.setType(ofVariable: v, to: typeF)
+            }
+            let genG = CodeGenerator("GenG", produces: [typeG]) { b in
+                calledGenerators.append("GenG")
+                let v = b.createNamedVariable(forBuiltin: "G")
+                b.setType(ofVariable: v, to: typeG)
+            }
+
+            // The unsatisfied requirements of this generator trigger findGeneratorSequence at that one level.
+            let genRecursionRoot = CodeGenerator(
+                "GenRecursionRoot", inputs: .required(typeA), produces: [typeRoot]
+            ) { b, _ in
+                calledGenerators.append("GenRecursionRoot")
+                let v = b.createNamedVariable(forBuiltin: "Root")
+                b.setType(ofVariable: v, to: typeRoot)
+            }
+
+            fuzzer.setCodeGenerators(
+                WeightedList<CodeGenerator>([
+                    (gPrefix, 1), (genX, 1), (genY, 1), (genZ, 1),
+                    (genD, 1), (genC, 1), (genE, 1), (genF, 1), (genG, 1), (genRecursionRoot, 1),
+                ]))
+
+            b.loadInt(42)
+
+            let trigger = CodeGenerator("Trigger", inputs: .required(typeRoot)) { _, _ in }
+            let plan = b.assembleSyntheticGenerator(for: trigger)
+
+            #expect(plan != nil)
+            _ = b.complete(generator: plan!, withBudget: 10)
+
+            #expect(calledGenerators.count == 6)
+            #expect(
+                Set(calledGenerators) == [
+                    "GenC", "GenE", "GenF", "GenG", "GenZ", "GenRecursionRoot",
+                ]
+            )
+            #expect(calledGenerators.last == "GenRecursionRoot")
+
+            #expect(
+                calledGenerators.firstIndex(of: "GenZ")! > calledGenerators.firstIndex(of: "GenC")!)
+            #expect(
+                calledGenerators.firstIndex(of: "GenZ")! > calledGenerators.firstIndex(of: "GenE")!)
+            #expect(
+                calledGenerators.firstIndex(of: "GenZ")! > calledGenerators.firstIndex(of: "GenF")!)
+            #expect(
+                calledGenerators.firstIndex(of: "GenZ")! > calledGenerators.firstIndex(of: "GenG")!)
+        }
+    }
+
+    @Test func testGeneratorResolutionDeduplicationCost() {
+        /*
+         * Generator Graph:
+         *
+         * Trigger --> GenRecursionRoot(req: TypeA)
+         *
+         * Path 1 (Cost = 2):
+         *    Gen1(req: TypeB, TypeC) --> GenB, GenC
+         *
+         * Path 2 (Cost = 1):
+         *    Gen2(req: TypeD, TypeD) --> GenD
+         *
+         * The algorithm deduplicates the double TypeD requirement, giving Gen2 a lower cost (1 missing input)
+         * compared to Gen1 (2 missing inputs). Thus Gen2 is scheduled.
+         */
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+            let typeA = ILType.object(ofGroup: "A")
+            let typeB = ILType.object(ofGroup: "B")
+            let typeC = ILType.object(ofGroup: "C")
+            let typeD = ILType.object(ofGroup: "D")
+            let typeRoot = ILType.object(ofGroup: "Root")
+
+            var calledGenerators = [String]()
+
+            let gPrefix = CodeGenerator("GPrefix", produces: [.undefined], useInPrefix: true) { b in
+                Issue.record("should not be called")
+            }
+
+            // Gen1 needs B and C. Cost = 2.
+            let gen1 = CodeGenerator("Gen1", inputs: .required(typeB, typeC), produces: [typeA]) {
+                b, _, _ in
+                calledGenerators.append("Gen1")
+                let v = b.createNamedVariable(forBuiltin: "A")
+                b.setType(ofVariable: v, to: typeA)
+            }
+
+            // Gen2 needs D and D. Cost = 1 (due to Set deduplication).
+            let gen2 = CodeGenerator("Gen2", inputs: .required(typeD, typeD), produces: [typeA]) {
+                b, _, _ in
+                calledGenerators.append("Gen2")
+                let v = b.createNamedVariable(forBuiltin: "A")
+                b.setType(ofVariable: v, to: typeA)
+            }
+
+            let genB = CodeGenerator("GenB", produces: [typeB]) { b in
+                calledGenerators.append("GenB")
+                let v = b.createNamedVariable(forBuiltin: "B")
+                b.setType(ofVariable: v, to: typeB)
+            }
+            let genC = CodeGenerator("GenC", produces: [typeC]) { b in
+                calledGenerators.append("GenC")
+                let v = b.createNamedVariable(forBuiltin: "C")
+                b.setType(ofVariable: v, to: typeC)
+            }
+            let genD = CodeGenerator("GenD", produces: [typeD]) { b in
+                calledGenerators.append("GenD")
+                let v = b.createNamedVariable(forBuiltin: "D")
+                b.setType(ofVariable: v, to: typeD)
+            }
+
+            // The unsatisfied requirements of this generator trigger findGeneratorSequence at that one level.
+            let genRecursionRoot = CodeGenerator(
+                "GenRecursionRoot", inputs: .required(typeA), produces: [typeRoot]
+            ) { b, _ in
+                calledGenerators.append("GenRecursionRoot")
+                let v = b.createNamedVariable(forBuiltin: "Root")
+                b.setType(ofVariable: v, to: typeRoot)
+            }
+
+            fuzzer.setCodeGenerators(
+                WeightedList<CodeGenerator>([
+                    (gPrefix, 1), (gen1, 1), (gen2, 1), (genB, 1), (genC, 1), (genD, 1),
+                    (genRecursionRoot, 1),
+                ]))
+
+            b.loadInt(42)
+
+            let trigger = CodeGenerator("Trigger", inputs: .required(typeRoot)) { _, _ in }
+            let plan = b.assembleSyntheticGenerator(for: trigger)
+
+            #expect(plan != nil)
+            _ = b.complete(generator: plan!, withBudget: 10)
+
+            // Because Gen2 has a cost of 1 (D is deduplicated), it should be prioritized over Gen1 (cost of 2).
+            #expect(calledGenerators.contains("Gen2"))
+            #expect(!calledGenerators.contains("Gen1"))
+            #expect(calledGenerators == ["GenD", "Gen2", "GenRecursionRoot"])
+        }
+    }
+
+    @Test func testGeneratorResolutionSequenceDeduplication() {
+        /*
+         * Generator Graph:
+         *
+         * Trigger --> GenRecursionRoot(req: TypeA, TypeB)
+         *
+         *    GenA(req: TypeE)
+         *    GenB(req: TypeC, TypeF) --> GenC(req: TypeD) --> GenD(req: SuperTypeOfE)
+         *
+         *    GenE(produces TypeE, fulfills SuperTypeOfE)
+         *    GenF(no req)
+         *
+         * The Min-Heap tie-breaking accidentally generates a duplicate `GenE`,
+         * which relies on finalGeneratorSequence to correctly deduplicate the execution chain.
+         */
+        let fuzzer = makeMockFuzzer()
+        fuzzer.sync {
+            let b = fuzzer.makeBuilder()
+
+            let typeA = ILType.object(ofGroup: "A")
+            let typeB = ILType.object(ofGroup: "B")
+            let typeC = ILType.object(ofGroup: "C")
+            let typeD = ILType.object(ofGroup: "D")
+            let typeE = ILType.object(ofGroup: "E", withProperties: ["foo"])
+            let typeF = ILType.object(ofGroup: "F")
+            let superTypeOfE = ILType.object(ofGroup: "E")
+            let typeRoot = ILType.object(ofGroup: "Root")
+
+            var calledGenerators = [String]()
+
+            let gPrefix = CodeGenerator("GPrefix", produces: [.undefined], useInPrefix: true) { b in
+                Issue.record("should not be called")
+            }
+
+            let genE = CodeGenerator("GenE", produces: [typeE]) { b in
+                calledGenerators.append("GenE")
+                let v = b.createNamedVariable(forBuiltin: "E")
+                b.setType(ofVariable: v, to: typeE)
+            }
+            let genD = CodeGenerator("GenD", inputs: .required(superTypeOfE), produces: [typeD]) {
+                b, _ in
+                calledGenerators.append("GenD")
+                let v = b.createNamedVariable(forBuiltin: "D")
+                b.setType(ofVariable: v, to: typeD)
+            }
+            let genC = CodeGenerator("GenC", inputs: .required(typeD), produces: [typeC]) { b, _ in
+                calledGenerators.append("GenC")
+                let v = b.createNamedVariable(forBuiltin: "C")
+                b.setType(ofVariable: v, to: typeC)
+            }
+            let genF = CodeGenerator("GenF", produces: [typeF]) { b in
+                calledGenerators.append("GenF")
+                let v = b.createNamedVariable(forBuiltin: "F")
+                b.setType(ofVariable: v, to: typeF)
+            }
+            let genB = CodeGenerator("GenB", inputs: .required(typeC, typeF), produces: [typeB]) {
+                b, _, _ in
+                calledGenerators.append("GenB")
+                let v = b.createNamedVariable(forBuiltin: "B")
+                b.setType(ofVariable: v, to: typeB)
+            }
+            let genA = CodeGenerator("GenA", inputs: .required(typeE), produces: [typeA]) { b, _ in
+                calledGenerators.append("GenA")
+                let v = b.createNamedVariable(forBuiltin: "A")
+                b.setType(ofVariable: v, to: typeA)
+            }
+
+            // The unsatisfied requirements of this generator trigger findGeneratorSequence at that one level.
+            let genRecursionRoot = CodeGenerator(
+                "GenRecursionRoot", inputs: .required(typeA, typeB), produces: [typeRoot]
+            ) { b, _, _ in
+                calledGenerators.append("GenRecursionRoot")
+                let v = b.createNamedVariable(forBuiltin: "Root")
+                b.setType(ofVariable: v, to: typeRoot)
+            }
+
+            fuzzer.setCodeGenerators(
+                WeightedList<CodeGenerator>([
+                    (gPrefix, 1), (genA, 1), (genB, 1), (genC, 1), (genD, 1), (genE, 1), (genF, 1),
+                    (genRecursionRoot, 1),
+                ]))
+
+            b.loadInt(42)
+
+            let triggerGenerator = CodeGenerator(
+                "TriggerGenerator", inputs: .required(typeRoot)
+            ) { _, _ in }
+
+            let plan = b.assembleSyntheticGenerator(for: triggerGenerator)
+
+            #expect(plan != nil)
+            _ = b.complete(generator: plan!, withBudget: 10)
+
+            #expect(calledGenerators.count == 7)
+            #expect(
+                Set(calledGenerators) == [
+                    "GenE", "GenA", "GenD", "GenF", "GenC", "GenB", "GenRecursionRoot",
+                ])
+
+            #expect(
+                calledGenerators.firstIndex(of: "GenE")! < calledGenerators.firstIndex(of: "GenA")!)
+            #expect(
+                calledGenerators.firstIndex(of: "GenE")! < calledGenerators.firstIndex(of: "GenD")!)
+            #expect(
+                calledGenerators.firstIndex(of: "GenD")! < calledGenerators.firstIndex(of: "GenC")!)
+            #expect(
+                calledGenerators.firstIndex(of: "GenC")! < calledGenerators.firstIndex(of: "GenB")!)
+            #expect(
+                calledGenerators.firstIndex(of: "GenF")! < calledGenerators.firstIndex(of: "GenB")!)
+            #expect(
+                calledGenerators.firstIndex(of: "GenB")! < calledGenerators.firstIndex(
+                    of: "GenRecursionRoot")!)
+            #expect(
+                calledGenerators.firstIndex(of: "GenA")! < calledGenerators.firstIndex(
+                    of: "GenRecursionRoot")!)
+        }
+    }
+}

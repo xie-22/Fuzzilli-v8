@@ -1,0 +1,20 @@
+v0 <- BeginPlainFunction -> 
+    v1 <- LoadString 'var z = 3;'
+    v2 <- CreateNamedVariable 'eval', 'none'
+    v3 <- CallFunction v2, [v1]
+    v4 <- CreateNamedVariable 'z', 'none'
+    Return v4
+EndPlainFunction
+v5 <- LoadInteger '3'
+v6 <- CallFunction v0, []
+v7 <- CreateNamedVariable 'assertEquals', 'none'
+v8 <- CallFunction v7, [v5, v6]
+
+
+function fun() {
+    eval("var z = 3;");
+    return z;
+}
+assertEquals(3, fun());
+
+FuzzIL program written to /v8/fuzzilli/seed_cve2025_2026/test9.fzil

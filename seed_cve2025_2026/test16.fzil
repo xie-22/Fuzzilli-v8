@@ -1,0 +1,84 @@
+v0 <- BeginPlainFunction -> 
+    v1 <- BeginPlainFunction -> 
+        v2 <- BeginPlainFunction -> v3
+            v4 <- GetProperty v3, 'constructor'
+            v5 <- CreateNamedVariable 'v44', 'let', v4
+            v6 <- LoadFloat '1.1'
+            v7 <- Construct v5, [v6]
+            v8 <- LoadThis
+            SetProperty v8, 'g', v3
+            v9 <- LoadThis
+            v10 <- CreateNamedVariable 'Object', 'none'
+            v11 <- CallMethod v10, 'freeze', [v9]
+        EndPlainFunction
+        v12 <- LoadInteger '0'
+        v13 <- Construct v2, [v12]
+        v14 <- CreateNamedVariable 'v50', 'let', v13
+        v15 <- Construct v2, [v14]
+    EndPlainFunction
+    BeginForLoopInitializer
+        v16 <- LoadInteger '0'
+    BeginForLoopCondition -> v17
+        v18 <- LoadInteger '5000000'
+        v19 <- Compare v17, '<', v18
+    BeginForLoopAfterthought v19 -> v20
+        v21 <- UnaryOperation v20, '++'
+    BeginForLoopBody -> v22, v23
+        v24 <- CallFunction v1, []
+    EndForLoop
+EndPlainFunction
+v25 <- CreateArray []
+v26 <- CreateNamedVariable 'workers', 'const', v25
+BeginForLoopInitializer
+    v27 <- LoadInteger '0'
+BeginForLoopCondition -> v28
+    v29 <- LoadInteger '30'
+    v30 <- Compare v28, '<', v29
+BeginForLoopAfterthought v30 -> v31
+    v32 <- UnaryOperation v31, '++'
+BeginForLoopBody -> v33, v34
+    v35 <- CreateNamedVariable 'Worker', 'none'
+    v36 <- LoadString 'function'
+    BeginObjectLiteral
+        ObjectLiteralAddProperty `type`, v36
+    v37 <- EndObjectLiteral
+    v38 <- Construct v35, [v0, v37]
+    v39 <- CallMethod v26, 'push', [v38]
+EndForLoop
+BeginForLoop type='forOf' async='false' v26 -> v40, v41
+    BeginTry
+        v42 <- CallMethod v40, 'getMessage', []
+    BeginCatch -> v43
+    EndTryCatch
+EndForLoop
+
+
+function f24() {
+    function f23() {
+        function F40(a3) {
+            let v44 = a3.constructor;
+            new v44(1.1);
+            this.g = a3;
+            Object.freeze(this);
+        }
+        const v13 = new F40(0);
+        let v50 = v13;
+        new F40(v50);
+    }
+    for (let i17 = 0; i17 < 5000000; i17++) {
+        f23();
+    }
+}
+const workers = [];
+for (let i28 = 0; i28 < 30; i28++) {
+    const v38 = new Worker(f24, { type: "function" });
+    workers.push(v38);
+}
+for (const v40 of workers) {
+    try {
+        v40.getMessage();
+    } catch(e43) {
+    }
+}
+
+FuzzIL program written to /v8/fuzzilli/seed_cve2025_2026/test16.fzil

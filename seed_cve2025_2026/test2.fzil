@@ -1,0 +1,80 @@
+v0 <- BeginClassDefinition (decl)
+EndClassDefinition
+v1 <- BeginClassDefinition (decl) v0
+    BeginClassConstructor -> v2
+        v3 <- LoadInteger '0'
+        v4 <- CreateNamedVariable 'x', 'let', v3
+        v5 <- LoadInteger '0'
+        v6 <- LoadInteger '1'
+        v7 <- LoadInteger '2'
+        v8 <- LoadInteger '3'
+        v9 <- LoadInteger '4'
+        v10 <- LoadInteger '5'
+        v11 <- LoadInteger '6'
+        v12 <- LoadInteger '7'
+        v13 <- LoadInteger '8'
+        v14 <- LoadInteger '9'
+        v15 <- LoadInteger '0'
+        BeginSwitch v15 -> v16
+            BeginSwitchCase v5
+            EndSwitchCase fallsThrough
+            BeginSwitchCase v6
+            EndSwitchCase fallsThrough
+            BeginSwitchCase v7
+            EndSwitchCase fallsThrough
+            BeginSwitchCase v8
+            EndSwitchCase fallsThrough
+            BeginSwitchCase v9
+            EndSwitchCase fallsThrough
+            BeginSwitchCase v10
+            EndSwitchCase fallsThrough
+            BeginSwitchCase v11
+            EndSwitchCase fallsThrough
+            BeginSwitchCase v12
+            EndSwitchCase fallsThrough
+            BeginSwitchCase v13
+            EndSwitchCase fallsThrough
+            BeginSwitchCase v14
+                Update v4, '+', v2
+                Break
+            EndSwitchCase fallsThrough
+            BeginSwitchCase v2
+            EndSwitchCase fallsThrough
+        EndSwitch
+    EndClassConstructor
+EndClassDefinition
+v17 <- BeginArrowFunction -> 
+    v18 <- Construct v1, []
+EndArrowFunction
+v19 <- CreateNamedVariable 'ReferenceError', 'none'
+v20 <- CreateNamedVariable 'assertThrows', 'none'
+v21 <- CallFunction v20, [v17, v19]
+
+
+class C0 {
+}
+class C1 extends C0 {
+    constructor() {
+        let x = 0;
+        switch (0) {
+            case 0:
+            case 1:
+            case 2:
+            case 3:
+            case 4:
+            case 5:
+            case 6:
+            case 7:
+            case 8:
+            case 9:
+                x += this;
+                break;
+            case this:
+        }
+    }
+}
+assertThrows(() => {
+    new C1();
+}, ReferenceError);
+
+FuzzIL program written to /v8/fuzzilli/seed_cve2025_2026/test2.fzil

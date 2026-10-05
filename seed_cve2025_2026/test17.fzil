@@ -1,0 +1,69 @@
+v0 <- BeginPlainFunction -> 
+    v1 <- LoadArguments
+    v2 <- GetProperty v1, 'callee'
+    v3 <- GetProperty v2, 'name'
+    v4 <- CreateNamedVariable 'print', 'none'
+    v5 <- CallFunction v4, [v3]
+    v6 <- CreateNamedVariable 'WasmModuleBuilder', 'none'
+    v7 <- Construct v6, []
+    v8 <- CreateNamedVariable 'builder', 'let', v7
+    v9 <- CreateNamedVariable 'kSig_i_i', 'none'
+    v10 <- CallMethod v8, 'addType', [v9]
+    v11 <- CreateNamedVariable 'block_sig', 'let', v10
+    v12 <- CreateNamedVariable 'kExprLocalGet', 'none'
+    v13 <- LoadInteger '0'
+    v14 <- CreateNamedVariable 'kExprBlock', 'none'
+    v15 <- LoadInteger '0'
+    v16 <- CreateNamedVariable 'kExprBrTable', 'none'
+    v17 <- LoadInteger '2'
+    v18 <- LoadInteger '2'
+    v19 <- LoadInteger '1'
+    v20 <- LoadInteger '0'
+    v21 <- CreateNamedVariable 'kExprEnd', 'none'
+    v22 <- CreateNamedVariable 'kExprI32Const', 'none'
+    v23 <- LoadInteger '1'
+    v24 <- CreateNamedVariable 'kExprI32Add', 'none'
+    v25 <- CreateNamedVariable 'kExprReturn', 'none'
+    v26 <- LoadInteger '2'
+    v27 <- CreateNamedVariable 'kExprI32Sub', 'none'
+    v28 <- CreateArray [v12, v13, v14, v11, v14, v11, v12, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v21, v22, v26, v27]
+    v29 <- LoadString 'br_table'
+    v30 <- CallMethod v8, 'addFunction', [v29, v9]
+    v31 <- CallMethod v30, 'addBody', [v28]
+    v32 <- CallMethod v31, 'exportFunc', []
+    v33 <- CallMethod v8, 'instantiate', []
+    v34 <- GetProperty v33, 'exports'
+    v35 <- CreateNamedVariable 'wasm', 'let', v34
+    v36 <- LoadInteger '0'
+    v37 <- LoadInteger '0'
+    v38 <- CallMethod v35, 'br_table', [v37]
+    v39 <- CreateNamedVariable 'assertEquals', 'none'
+    v40 <- CallFunction v39, [v36, v38]
+    v41 <- LoadInteger '1'
+    v42 <- UnaryOperation '-', v41
+    v43 <- LoadInteger '1'
+    v44 <- CallMethod v35, 'br_table', [v43]
+    v45 <- CallFunction v39, [v42, v44]
+    v46 <- LoadInteger '23'
+    v47 <- LoadInteger '22'
+    v48 <- CallMethod v35, 'br_table', [v47]
+    v49 <- CallFunction v39, [v46, v48]
+EndPlainFunction
+v50 <- CallFunction v0, []
+
+
+function BrTable() {
+    print(arguments.callee.name);
+    const v7 = new WasmModuleBuilder();
+    let builder = v7;
+    let block_sig = builder.addType(kSig_i_i);
+    const v28 = [kExprLocalGet,0,kExprBlock,block_sig,kExprBlock,block_sig,kExprLocalGet,0,kExprBrTable,2,2,1,0,kExprEnd,kExprI32Const,1,kExprI32Add,kExprReturn,kExprEnd,kExprI32Const,2,kExprI32Sub];
+    builder.addFunction("br_table", kSig_i_i).addBody(v28).exportFunc();
+    let wasm = builder.instantiate().exports;
+    assertEquals(0, wasm.br_table(0));
+    assertEquals(-1, wasm.br_table(1));
+    assertEquals(23, wasm.br_table(22));
+}
+BrTable();
+
+FuzzIL program written to /v8/fuzzilli/seed_cve2025_2026/test17.fzil

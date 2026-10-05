@@ -1,0 +1,137 @@
+// Copyright 2023 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+import Foundation
+import Testing
+
+@testable import Fuzzilli
+
+/// Compiler testsuite.
+///
+/// This testcase runs a number of "end-to-end" compiler tests using the .js files located in the CompilerTests/ directory:
+/// For every such JavaScript testcase:
+///  - The original code is executed inside a JavaScript engine (e.g. node.js) and the output recorded
+///  - The code is parsed into an AST, then compiled to FuzzIL
+///  - The resulting FuzzIL program is lifted back to JavaScript
+///  - The new JavaScript code is again executed inside the same engine and the output again recorded
+///  - The test passes if there are no errors along the way and if the output of both executions is identical
+@Suite(.enabled(if: shouldRunCompilerTests()))
+struct CompilerTests {
+    var nodejs: JavaScriptExecutor
+    var engine: JavaScriptExecutor
+    var parser: JavaScriptParser
+    var compiler: JavaScriptCompiler
+
+    init() throws {
+        self.nodejs = try #require(
+            JavaScriptExecutor(type: .nodejs, withArguments: ["--allow-natives-syntax"]))
+        // The babel-based parser requires node, but the testcases themselves
+        // may use syntax that the local node does not support (e.g. explicit
+        // resource management). If FUZZILLI_TEST_SHELL is set (e.g. to a
+        // fuzzilli-enabled d8), use it to execute the testcases.
+        if let shell = ProcessInfo.processInfo.environment["FUZZILLI_TEST_SHELL"] {
+            self.engine = JavaScriptExecutor(
+                withExecutablePath: shell, arguments: ["--allow-natives-syntax"], env: [])
+        } else {
+            self.engine = self.nodejs
+        }
+        self.parser = try #require(JavaScriptParser(executor: self.nodejs))
+        self.compiler = JavaScriptCompiler()
+    }
+
+    @Test func testFuzzILCompiler() throws {
+        let lifter = JavaScriptLifter(ecmaVersion: .es6, environment: JavaScriptEnvironment())
+
+        for testcasePath in enumerateAllTestcases() {
+            let testName = URL(fileURLWithPath: testcasePath).lastPathComponent
+
+            // Execute the original code and record the output.
+            let result1 = try engine.executeScript(at: URL(fileURLWithPath: testcasePath))
+            guard result1.isSuccess else {
+                Issue.record("TestCase \(testName) failed to execute. Output:\n\(result1.output)")
+                continue
+            }
+
+            // Compile the JavaScript code to FuzzIL...
+            guard let ast = try? parser.parse(testcasePath) else {
+                Issue.record("Could not parse \(testName)")
+                continue
+            }
+            guard let program = try? compiler.compile(ast) else {
+                Issue.record("Could not compile \(testName)")
+                continue
+            }
+
+            // ... then lift it back to JavaScript and execute it again.
+            let script = lifter.lift(program)
+            let result2 = try engine.executeScript(script)
+            guard result2.isSuccess else {
+                Issue.record(
+                    "TestCase \(testName) failed to execute after compiling and lifting. Output:\n\(result2.output)\nScript:\n\(script)"
+                )
+                continue
+            }
+
+            // The output of both executions must be identical.
+            #expect(
+                result1.output == result2.output,
+                "Testcase \(testName) failed.\nExpected output:\n\(result1.output)\nActual output:\n\(result2.output)"
+            )
+        }
+    }
+
+    @Test func testInvalidDestructuredUsing() throws {
+        // 1. Object destructuring with using: for (using {x} of y)
+        let script1 = "for (using {x} of [{}]) {}"
+        let error1 = try #require(throws: JavaScriptParser.ParserError.self) {
+            try compile(script: script1)
+        }
+        guard case .parsingFailed(let message1) = error1 else {
+            Issue.record("Expected parsingFailed, got \(error1)")
+            return
+        }
+        #expect(message1.contains("SyntaxError") || message1.contains("Assertion failed"))
+
+        // 2. Destructuring with using is forbidden in ECMAScript: { using {x} = {}; }
+        let script2 = "{ using {x} = {}; }"
+        let error2 = try #require(throws: JavaScriptParser.ParserError.self) {
+            try compile(script: script2)
+        }
+        guard case .parsingFailed(let message2) = error2 else {
+            Issue.record("Expected parsingFailed, got \(error2)")
+            return
+        }
+        #expect(message2.contains("SyntaxError"))
+    }
+
+    private func compile(script: String) throws -> Program {
+        let tempDir = FileManager.default.temporaryDirectory
+        let tempFile = tempDir.appendingPathComponent(UUID().uuidString + ".js")
+        try script.write(to: tempFile, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: tempFile) }
+
+        let ast = try parser.parse(tempFile.path)
+        return try compiler.compile(ast)
+    }
+
+    /// Returns the absolute paths of all .js compiler testcases.
+    private func enumerateAllTestcases() -> [String] {
+        return Bundle.module.paths(forResourcesOfType: "js", inDirectory: "CompilerTests")
+    }
+
+    public enum TestError: Error {
+        case parserError(String)
+    }
+
+}
